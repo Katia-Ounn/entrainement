@@ -1,0 +1,18 @@
+{
+  "feature_cols": [
+    "comp_level",
+    "DSLF",
+    "DSLM",
+    "pannes_7j",
+    "pannes_30j",
+    "pannes_90j",
+    "maint_7j",
+    "maint_30j",
+    "maint_90j"
+  ],
+  "n_features": 9,
+  "target_col": "RUL",
+  "lookback": 30,
+  "current_max_rul": 30,
+  "comment": "Ordre exact des colonnes à fournir au modèle dans X_num. Normaliser chaque colonne avec scaler_x avant prédiction."
+}

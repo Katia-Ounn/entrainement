@@ -1,0 +1,165 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+/* ═══════════════════════════════════════════════════════════════
+   THEME SWITCHER — Cevital (Phase 0)
+   - DARK = défaut (héritage Azure réussi, on le conserve)
+   - LIGHT = palette CEVITAL bleu/jaune, fond clair lisible
+   - Bascule via data-theme="light" sur <html> (gérée dans AppContext)
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ─── Color-scheme : indique au navigateur quel thème natif utiliser
+        pour scrollbars, form controls, autofill, etc.                  */
+:root[data-theme="dark"]  { color-scheme: dark;  }
+:root[data-theme="light"] { color-scheme: light; }
+
+/* ─── Dark theme (défaut) ─────────────────────────────────────── */
+:root,
+:root[data-theme="dark"] {
+  /* Backgrounds */
+  --bg-deep:        #0a0c14;
+  --bg-base:        #0f1117;
+  --bg-panel:       #0f1117;
+  --bg-card:        #1a1d2e;
+  --bg-elevated:    #232640;
+
+  /* Borders */
+  --border:         #2a2d45;
+  --border-default: #2a2d45;
+  --border-subtle:  #1f2236;
+  --border-strong:  #3d4172;
+  --border-glow:    #3d4172;   /* alias rétro-compat */
+
+  /* Text */
+  --text-primary:   #e4e6f0;
+  --text-secondary: #c8cad4;
+  --text-tertiary:  #8a8d9f;
+  --text-muted:     #4a4d6a;
+
+  /* Brand CEVITAL */
+  --brand-primary:  #4fc3f7;     /* en dark on garde le bleu clair pour la lisibilité */
+  --brand-secondary:#fbbf24;     /* jaune CEVITAL */
+
+  /* Accents sémantiques (composants, charts) */
+  --accent-blue:    #4fc3f7;
+  --accent-green:   #81c784;
+  --accent-orange:  #ffb74d;
+  --accent-red:     #f06292;
+  --accent-purple:  #ce93d8;
+  --accent-pink:    #f48fb1;
+  --accent-warning: #ffb74d;
+
+  /* Chart colors (Recharts) */
+  --chart-blue:     #4fc3f7;
+  --chart-green:    #66bb6a;
+  --chart-orange:   #ffa726;
+  --chart-red:      #ef5350;
+  --chart-purple:   #ab47bc;
+
+  /* Status */
+  --success:        #4caf50;
+  --warning:        #ff9800;
+  --error:          #f44336;
+
+  /* Tints d'arrière-plan sémantiques (status badges, surlignages) */
+  --tint-success-bg: #0d2a1a;
+  --tint-error-bg:   #2a0d0d;
+  --tint-info-bg:    #0d1a2a;
+  --tint-purple-bg:  #1a0d2a;
+  --bg-card-alt:     #1e2135;
+
+  /* Header backdrop translucide */
+  --header-bg-rgba: rgba(15, 17, 23, 0.95);
+}
+
+/* ─── Light theme — palette CEVITAL ────────────────────────────── */
+:root[data-theme="light"] {
+  /* Backgrounds (canvas clair, élévation hiérarchique) */
+  --bg-deep:        #f1f5f9;
+  --bg-base:        #f8fafc;
+  --bg-panel:       #ffffff;
+  --bg-card:        #ffffff;
+  --bg-elevated:    #ffffff;
+
+  /* Borders */
+  --border:         #cbd5e1;
+  --border-default: #cbd5e1;
+  --border-subtle:  #e2e8f0;
+  --border-strong:  #93c5fd;
+  --border-glow:    #93c5fd;   /* alias rétro-compat */
+
+  /* Text (foncé pour contraste sur blanc) */
+  --text-primary:   #0f172a;
+  --text-secondary: #334155;
+  --text-tertiary:  #475569;
+  --text-muted:     #64748b;
+
+  /* Brand CEVITAL — bleu profond + jaune */
+  --brand-primary:  #1e3a8a;     /* bleu CEVITAL profond */
+  --brand-secondary:#fbbf24;     /* jaune CEVITAL */
+
+  /* Accents sémantiques (assombris pour rester lisibles sur blanc) */
+  --accent-blue:    #1d4ed8;
+  --accent-green:   #15803d;
+  --accent-orange:  #c2410c;
+  --accent-red:     #b91c1c;
+  --accent-purple:  #7e22ce;
+  --accent-pink:    #be185d;
+  --accent-warning: #c2410c;
+
+  /* Chart colors (variantes plus foncées) */
+  --chart-blue:     #1d4ed8;
+  --chart-green:    #15803d;
+  --chart-orange:   #c2410c;
+  --chart-red:      #b91c1c;
+  --chart-purple:   #7e22ce;
+
+  /* Status */
+  --success:        #16a34a;
+  --warning:        #d97706;
+  --error:          #dc2626;
+
+  /* Tints d'arrière-plan sémantiques (status badges, surlignages) */
+  --tint-success-bg: #dcfce7;
+  --tint-error-bg:   #fee2e2;
+  --tint-info-bg:    #dbeafe;
+  --tint-purple-bg:  #ede9fe;
+  --bg-card-alt:     #f8fafc;
+
+  /* Header backdrop translucide */
+  --header-bg-rgba: rgba(255, 255, 255, 0.92);
+}
+
+/* ─── Base styles ─────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+
+body {
+  background-color: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: 'Space Grotesk', sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-panel); }
+::-webkit-scrollbar-thumb { background: var(--border-glow); border-radius: 3px; }
+
+.font-mono { font-family: 'JetBrains Mono', monospace !important; }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.5; transform: scale(1.3); }
+}
+.pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+
+/* Lisser les transitions de thème sur les surfaces principales */
+header, main, footer, .theme-aware {
+  transition: background-color 0.25s ease,
+              border-color 0.25s ease,
+              color 0.25s ease;
+}

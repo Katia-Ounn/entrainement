@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="fr" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>CEVITAL · PdM Platform</title>
+
+    <!--
+      Bootstrap theme AVANT le bundle React (anti-FOUC).
+      Lit la valeur sauvegardée par AppContext via load('cevital_theme', 'dark')
+      (qui stocke un JSON.stringify, donc avec guillemets : "dark" ou "light").
+      Définit `data-theme` sur <html> dès le tout premier paint → les variables
+      CSS du thème actif s'appliquent immédiatement, plus aucun flash.
+    -->
+    <script>
+      (function () {
+        try {
+          var raw = localStorage.getItem('cevital_theme');
+          var t = 'dark';
+          if (raw) {
+            try { t = JSON.parse(raw); } catch (_) { t = raw; }
+          }
+          if (t !== 'light' && t !== 'dark') t = 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

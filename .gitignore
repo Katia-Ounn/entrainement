@@ -1,0 +1,57 @@
+# ─── Python ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ─── Environnement virtuel ────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── TensorFlow / Keras / Tuner ───────────────────────────
+*.keras
+*.h5
+my_dir/
+tuner_results/
+keras_tuner/
+
+# ─── Node / Frontend ──────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+.npm/
+
+# ─── Données & exports (fichiers lourds) ──────────────────
+data/*.csv
+data/*.xlsx
+exports/
+
+# ─── Base de données locale ───────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ─── Logs & temporaires ───────────────────────────────────
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ─── Variables d'environnement ────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── IDE ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
