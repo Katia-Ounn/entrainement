@@ -16,8 +16,8 @@ env/
 ENV/
 
 # ─── TensorFlow / Keras / Tuner ───────────────────────────
-*.keras
-*.h5
+# *.keras  ← inclus pour partager les modèles entraînés
+# *.h5     ← inclus pour partager les modèles entraînés
 my_dir/
 tuner_results/
 keras_tuner/
