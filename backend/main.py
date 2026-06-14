@@ -91,6 +91,58 @@ app.add_middleware(
 init_db()
 
 
+def _fix_dataset_paths():
+    """
+    Corrige automatiquement les chemins absolus stockés en BDD.
+    Utile quand la BDD est partagée entre machines (git clone / binôme).
+    Les chemins sont reconstruits à partir de DATASETS_DIR de la machine actuelle.
+    """
+    db = SessionLocal()
+    try:
+        datasets = db.query(Dataset).all()
+        for ds in datasets:
+            folder = DATASETS_DIR / str(ds.id)
+            if not folder.exists():
+                continue  # dossier absent → on ne touche pas
+            changed = False
+
+            # Reconstruire folder_path
+            new_folder = str(folder)
+            if ds.folder_path != new_folder:
+                ds.folder_path = new_folder
+                changed = True
+
+            # Reconstruire failure_path
+            f_path = folder / "failure.csv"
+            if f_path.exists() and str(f_path) != ds.failure_path:
+                ds.failure_path = str(f_path)
+                changed = True
+
+            # Reconstruire equipment_path
+            e_path = folder / "equipment.csv"
+            if e_path.exists() and str(e_path) != ds.equipment_path:
+                ds.equipment_path = str(e_path)
+                changed = True
+
+            # Reconstruire v1_path
+            v1_path = folder / "dataset_v1.csv"
+            if v1_path.exists() and str(v1_path) != ds.v1_path:
+                ds.v1_path = str(v1_path)
+                changed = True
+
+            if changed:
+                db.add(ds)
+
+        db.commit()
+        print(f"[startup] Chemins datasets corrigés pour {len(datasets)} dataset(s).")
+    except Exception as e:
+        print(f"[startup] Erreur fix_dataset_paths: {e}")
+    finally:
+        db.close()
+
+_fix_dataset_paths()
+
+
 # ═══════════════════════════════════════════════════════════════
 # Pipeline cache (un instance par dataset)
 # ═══════════════════════════════════════════════════════════════
