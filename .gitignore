@@ -34,7 +34,7 @@ data/*.xlsx
 exports/
 
 # ─── Base de données locale ───────────────────────────────
-*.db
+# *.db  ← inclus dans le repo pour partager les datasets avec la binôme
 *.sqlite
 *.sqlite3
 
