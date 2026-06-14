@@ -187,19 +187,37 @@ def _get_pipeline(dataset_id: int, db: Session) -> CevitalPipeline:
         ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
         if not ds:
             raise HTTPException(404, f"Dataset {dataset_id} introuvable")
-        if not ds.failure_path or not ds.equipment_path:
-            raise HTTPException(400, "Dataset incomplet : CSV manquants")
+
+        # ✅ Toujours reconstruire les chemins depuis DATASETS_DIR local
+        # → évite les chemins absolus d'une autre machine stockés en BDD
+        folder       = DATASETS_DIR / str(dataset_id)
+        failure_path = folder / "failure.csv"
+        equipment_path = folder / "equipment.csv"
+
+        if not failure_path.exists():
+            raise HTTPException(400, f"failure.csv introuvable dans {folder}")
+        if not equipment_path.exists():
+            raise HTTPException(400, f"equipment.csv introuvable dans {folder}")
+
+        # Mettre à jour la BDD avec les chemins locaux corrects
+        ds.folder_path    = str(folder)
+        ds.failure_path   = str(failure_path)
+        ds.equipment_path = str(equipment_path)
+        v1 = folder / "dataset_v1.csv"
+        if v1.exists():
+            ds.v1_path = str(v1)
+        db.add(ds); db.commit()
 
         # 1. Première instanciation pour détecter l'année dominante
         pipe = CevitalPipeline()
-        pipe.load_raw_data(ds.failure_path, ds.equipment_path)
+        pipe.load_raw_data(str(failure_path), str(equipment_path))
 
         # 2. Si année dominante ≠ défaut, réinstancier proprement
         dominant = _detect_dominant_year(pipe.df_fail)
         if dominant is not None and dominant != pipe.year:
             print(f"[pipeline] auto-detected year={dominant} (default {pipe.year}) — reinstantiating")
             pipe = CevitalPipeline(config={"year": dominant})
-            pipe.load_raw_data(ds.failure_path, ds.equipment_path)
+            pipe.load_raw_data(str(failure_path), str(equipment_path))
 
         _PIPELINE_CACHE[dataset_id] = pipe
         return pipe
