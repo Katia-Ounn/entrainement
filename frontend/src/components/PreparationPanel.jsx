@@ -17,7 +17,7 @@
  */
 import { useState, useEffect, useMemo } from 'react';
 import {
-  BarChart3, Cog, TrendingUp, Layers, GitMerge,
+  BarChart3, Cog, TrendingUp, Layers, RefreshCw,
   Upload, Database, CheckCircle2, Lock, ChevronRight,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -28,7 +28,7 @@ import RawEDA              from './prep/RawEDA';
 import FeatureEngineering  from './prep/FeatureEngineering';
 import FeaturesEDA         from './prep/FeaturesEDA';
 import Preprocessing       from './prep/Preprocessing';
-import MergeDatasets       from './prep/MergeDatasets';
+import UpdateData          from './prep/UpdateData';
 
 const API = 'http://localhost:8000';
 
@@ -38,7 +38,7 @@ const SUBTABS = [
   { id: 'features',      label: 'Feature Engineering', icon: Cog,         step: 2, gate: 'raw_eda'    },
   { id: 'features_eda',  label: 'EDA Features',        icon: TrendingUp,  step: 3, gate: 'features'   },
   { id: 'preprocessing', label: 'Prétraitement',       icon: Layers,      step: 4, gate: 'features_eda' },
-  { id: 'merge',         label: 'Fusion / Réentraîn.', icon: GitMerge,    step: 5, gate: null         },
+  { id: 'update',        label: 'Mise à jour données', icon: RefreshCw,   step: 5, gate: null         },
 ];
 
 
@@ -96,8 +96,8 @@ export default function PreparationPanel() {
   };
 
   // Progression (X/5)
-  const stepsValidated = SUBTABS.filter(t => prepStepCompleted.includes(t.id) || t.id === 'merge')
-                                .filter(t => t.id !== 'merge')
+  const stepsValidated = SUBTABS.filter(t => prepStepCompleted.includes(t.id) || t.id === 'update')
+                                .filter(t => t.id !== 'update')
                                 .length;
   const progressPct = Math.round((stepsValidated / 4) * 100);
 
@@ -256,7 +256,7 @@ export default function PreparationPanel() {
             exit={{    opacity: 0, x: -12 }}
             transition={{ duration: 0.22 }}
           >
-            {!currentDatasetId && activeSubtab !== 'merge' && (
+            {!currentDatasetId && activeSubtab !== 'update' && (
               <EmptyState onUpload={() => setShowUpload(true)} />
             )}
 
@@ -284,11 +284,11 @@ export default function PreparationPanel() {
                 onCompleted={() => { handleAdvance('preprocessing'); fetchDatasets(); }}
               />
             )}
-            {activeSubtab === 'merge' && (
-              <MergeDatasets
+            {activeSubtab === 'update' && (
+              <UpdateData
                 datasetId={currentDatasetId}
-                datasets={datasets}
-                onMergeDone={() => { fetchDatasets(); }}
+                currentDataset={currentDataset}
+                onUpdated={() => { fetchDatasets(); }}
               />
             )}
           </motion.div>

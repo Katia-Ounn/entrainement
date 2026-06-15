@@ -113,6 +113,56 @@ class CevitalPipeline:
         self.phases_completed: List[str] = []
 
     # ═══════════════════════════════════════════════════════════════
+    # NORMALISATION FORMAT GMAO (nouveau export → format pipeline)
+    # ═══════════════════════════════════════════════════════════════
+    @staticmethod
+    def detect_format(df: pd.DataFrame) -> str:
+        """Détecte le format du CSV : 'new' (export GMAO) ou 'old' (format pipeline)."""
+        new_cols = {'date_declaration', 'equipment_code', 'equipment_level', 'parent_code'}
+        old_cols = {'WOWO_DECLARATION_DATE', 'WOWO_EQUIPMENT', 'WOWO_EQUIPMENT_LEVEL'}
+        if new_cols.issubset(set(df.columns)):
+            return 'new'
+        if old_cols.issubset(set(df.columns)):
+            return 'old'
+        return 'unknown'
+
+    @staticmethod
+    def normalize_gmao_export(df: pd.DataFrame):
+        """
+        Normalise un export GMAO (nouveau format) vers le format pipeline.
+        Retourne (df_fail_normalized, df_equip_derived).
+        Le df_equip est dérivé directement du fichier — pas besoin d'equipment.csv séparé.
+        """
+        COLUMN_MAP = {
+            'date_declaration':      'WOWO_DECLARATION_DATE',
+            'date_fin':              'WOWO_END_DATE',
+            'date_creation':         'WOWO_CREATION_DATE',
+            'equipment_code':        'WOWO_EQUIPMENT',
+            'equipment_level':       'WOWO_EQUIPMENT_LEVEL',
+            'parent_code':           'failure_parent_code',
+            'parent_level':          'failure_parent_level',
+            'type_travail':          'WOWO_JOB_CLASS',
+            'cout_total':            'WOWO_TOTAL_COST',
+            'system_equipment':      'WOWO_SYSTEM_EQUIPMENT',
+            'equipment_description': 'WOWO_DESCRIPTION',
+            'action_entity':         'WOWO_ACTION_ENTITY',
+            'source':                'source',
+        }
+        df_fail = df.rename(columns={k: v for k, v in COLUMN_MAP.items() if k in df.columns})
+
+        # Dériver equipment.csv depuis les colonnes présentes
+        equip_cols = {
+            'WOWO_EQUIPMENT':       'EREQ_CODE',
+            'WOWO_EQUIPMENT_LEVEL': 'EREQ_LEVEL',
+            'failure_parent_code':  'EREQ_PARENT_EQUIPMENT',
+            'failure_parent_level': 'EREQ_PARENT_LEVEL',
+        }
+        avail = {k: v for k, v in equip_cols.items() if k in df_fail.columns}
+        df_equip = df_fail[list(avail.keys())].drop_duplicates().rename(columns=avail)
+
+        return df_fail, df_equip
+
+    # ═══════════════════════════════════════════════════════════════
     # PHASE 1 — CHARGEMENT + EDA BRUTE
     # ═══════════════════════════════════════════════════════════════
     def load_raw_data(self, failure_path: str, equipment_path: str) -> Dict:

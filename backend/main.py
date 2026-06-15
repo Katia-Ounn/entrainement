@@ -25,6 +25,7 @@ Routes implémentées :
 from __future__ import annotations
 
 import os
+import io
 import json
 import shutil
 import asyncio
@@ -409,6 +410,90 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     db.delete(ds)
     db.commit()
     return {"deleted": dataset_id}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 1.4.1b — MISE À JOUR DES DONNÉES (nouveau export GMAO)
+# ═══════════════════════════════════════════════════════════════
+@app.post("/api/datasets/{dataset_id}/update_data")
+async def update_dataset_data(
+    dataset_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Remplace les données failure du dataset par un nouvel export GMAO.
+    Accepte l'ancien format (WOWO_*) et le nouveau format (date_declaration, equipment_code, ...).
+    Dérive automatiquement equipment.csv depuis le nouveau fichier.
+    Remet le dataset au statut 'uploaded' pour forcer un re-run du pipeline.
+    """
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not ds:
+        raise HTTPException(404, f"Dataset {dataset_id} introuvable")
+
+    folder = DATASETS_DIR / str(dataset_id)
+    folder.mkdir(exist_ok=True)
+
+    # Lire le fichier uploadé
+    content = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
+    except Exception as e:
+        raise HTTPException(400, f"Impossible de lire le CSV : {e}")
+
+    # Détecter le format
+    fmt = CevitalPipeline.detect_format(df)
+    if fmt == 'unknown':
+        raise HTTPException(400,
+            f"Format non reconnu. Colonnes trouvées : {list(df.columns)[:10]}. "
+            f"Attendu : colonnes 'date_declaration/equipment_code' (nouveau) "
+            f"ou 'WOWO_DECLARATION_DATE/WOWO_EQUIPMENT' (ancien).")
+
+    # Normaliser si nouveau format
+    if fmt == 'new':
+        df_fail, df_equip = CevitalPipeline.normalize_gmao_export(df)
+        # Sauvegarder equipment dérivé
+        equip_path = folder / "equipment.csv"
+        df_equip.to_csv(equip_path, index=False)
+        ds.equipment_path = str(equip_path)
+    else:
+        df_fail = df
+
+    # Sauvegarder failure.csv
+    fail_path = folder / "failure.csv"
+    df_fail.to_csv(fail_path, index=False)
+
+    # Calculer la période couverte
+    date_col = "WOWO_DECLARATION_DATE"
+    if date_col in df_fail.columns:
+        dates = pd.to_datetime(df_fail[date_col], errors="coerce").dropna()
+        date_min = dates.min().strftime("%Y-%m-%d") if len(dates) else None
+        date_max = dates.max().strftime("%Y-%m-%d") if len(dates) else None
+    else:
+        date_min = date_max = None
+
+    # Mettre à jour la BDD
+    ds.failure_path  = str(fail_path)
+    ds.folder_path   = str(folder)
+    ds.n_rows        = int(len(df_fail))
+    ds.period_start  = date_min
+    ds.period_end    = date_max
+    ds.status        = DatasetStatus.UPLOADED  # reset → re-run pipeline
+    ds.v1_path       = None
+    db.add(ds); db.commit()
+
+    # Invalider le cache pipeline
+    _invalidate_pipeline(dataset_id)
+
+    return {
+        "ok":        True,
+        "format":    fmt,
+        "n_rows":    int(len(df_fail)),
+        "date_min":  date_min,
+        "date_max":  date_max,
+        "n_cols":    int(len(df_fail.columns)),
+        "msg":       f"✅ Données mises à jour ({len(df_fail):,} lignes · {date_min} → {date_max})",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
