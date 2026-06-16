@@ -422,10 +422,12 @@ async def update_dataset_data(
     db: Session = Depends(get_db),
 ):
     """
-    Remplace les données failure du dataset par un nouvel export GMAO.
-    Accepte l'ancien format (WOWO_*) et le nouveau format (date_declaration, equipment_code, ...).
-    Dérive automatiquement equipment.csv depuis le nouveau fichier.
-    Remet le dataset au statut 'uploaded' pour forcer un re-run du pipeline.
+    Ajoute de nouvelles données au failure.csv existant (Option A).
+    - Le nouveau fichier contient UNIQUEMENT de nouvelles interventions (dates > failure existant)
+    - Normalise les colonnes si nouveau format GMAO (date_declaration, equipment_code, ...)
+    - Vérifie les doublons avant concaténation
+    - Concatène avec le failure.csv existant et sauvegarde
+    - Remet le dataset au statut 'uploaded' pour forcer un re-run du pipeline
     """
     ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
     if not ds:
@@ -437,62 +439,83 @@ async def update_dataset_data(
     # Lire le fichier uploadé
     content = await file.read()
     try:
-        df = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
+        df_new = pd.read_csv(io.BytesIO(content), encoding="utf-8-sig")
     except Exception as e:
         raise HTTPException(400, f"Impossible de lire le CSV : {e}")
 
-    # Détecter le format
-    fmt = CevitalPipeline.detect_format(df)
+    # Détecter le format et normaliser
+    fmt = CevitalPipeline.detect_format(df_new)
     if fmt == 'unknown':
         raise HTTPException(400,
-            f"Format non reconnu. Colonnes trouvées : {list(df.columns)[:10]}. "
+            f"Format non reconnu. Colonnes trouvées : {list(df_new.columns)[:10]}. "
             f"Attendu : colonnes 'date_declaration/equipment_code' (nouveau) "
             f"ou 'WOWO_DECLARATION_DATE/WOWO_EQUIPMENT' (ancien).")
 
-    # Normaliser si nouveau format
     if fmt == 'new':
-        df_fail, df_equip = CevitalPipeline.normalize_gmao_export(df)
-        # Sauvegarder equipment dérivé
-        equip_path = folder / "equipment.csv"
-        df_equip.to_csv(equip_path, index=False)
-        ds.equipment_path = str(equip_path)
+        df_new_norm, df_equip_new = CevitalPipeline.normalize_gmao_export(df_new)
     else:
-        df_fail = df
+        df_new_norm = df_new
 
-    # Sauvegarder failure.csv
+    # Lire le failure.csv existant
     fail_path = folder / "failure.csv"
-    df_fail.to_csv(fail_path, index=False)
+    if not fail_path.exists():
+        raise HTTPException(400, "failure.csv existant introuvable — impossible de concaténer.")
+    df_existing = pd.read_csv(fail_path, encoding="utf-8-sig")
+    n_existing  = len(df_existing)
 
-    # Calculer la période couverte
+    # Concaténer + supprimer doublons
+    df_combined = pd.concat([df_existing, df_new_norm], ignore_index=True)
+    n_before    = len(df_combined)
+    df_combined = df_combined.drop_duplicates()
+    n_duplicates = n_before - len(df_combined)
+
+    # Trier par date
     date_col = "WOWO_DECLARATION_DATE"
-    if date_col in df_fail.columns:
-        dates = pd.to_datetime(df_fail[date_col], errors="coerce").dropna()
+    if date_col in df_combined.columns:
+        df_combined[date_col] = pd.to_datetime(df_combined[date_col], errors="coerce")
+        df_combined = df_combined.sort_values(date_col).reset_index(drop=True)
+        dates    = df_combined[date_col].dropna()
         date_min = dates.min().strftime("%Y-%m-%d") if len(dates) else None
         date_max = dates.max().strftime("%Y-%m-%d") if len(dates) else None
     else:
         date_min = date_max = None
 
+    # Sauvegarder failure.csv mis à jour
+    df_combined.to_csv(fail_path, index=False)
+
+    # Mettre à jour l'equipment si nouveau format
+    if fmt == 'new':
+        equip_path = folder / "equipment.csv"
+        # Fusionner avec l'equipment existant si présent
+        if equip_path.exists():
+            df_eq_exist  = pd.read_csv(equip_path, encoding="utf-8-sig")
+            df_equip_new = pd.concat([df_eq_exist, df_equip_new], ignore_index=True).drop_duplicates()
+        df_equip_new.to_csv(equip_path, index=False)
+        ds.equipment_path = str(equip_path)
+
     # Mettre à jour la BDD
-    ds.failure_path  = str(fail_path)
-    ds.folder_path   = str(folder)
-    ds.n_rows        = int(len(df_fail))
-    ds.period_start  = date_min
-    ds.period_end    = date_max
-    ds.status        = DatasetStatus.UPLOADED  # reset → re-run pipeline
-    ds.v1_path       = None
+    ds.failure_path = str(fail_path)
+    ds.folder_path  = str(folder)
+    ds.n_rows       = int(len(df_combined))
+    ds.period_start = date_min
+    ds.period_end   = date_max
+    ds.status       = DatasetStatus.UPLOADED
+    ds.v1_path      = None
     db.add(ds); db.commit()
 
-    # Invalider le cache pipeline
     _invalidate_pipeline(dataset_id)
 
     return {
-        "ok":        True,
-        "format":    fmt,
-        "n_rows":    int(len(df_fail)),
-        "date_min":  date_min,
-        "date_max":  date_max,
-        "n_cols":    int(len(df_fail.columns)),
-        "msg":       f"✅ Données mises à jour ({len(df_fail):,} lignes · {date_min} → {date_max})",
+        "ok":          True,
+        "format":      fmt,
+        "n_existing":  n_existing,
+        "n_new":       int(len(df_new_norm)),
+        "n_duplicates": n_duplicates,
+        "n_total":     int(len(df_combined)),
+        "date_min":    date_min,
+        "date_max":    date_max,
+        "n_cols":    int(len(df_combined.columns)),
+        "msg":       f"✅ Données mises à jour ({len(df_combined):,} lignes · {date_min} → {date_max})",
     }
 
 

@@ -79,7 +79,7 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
             Mise à jour des données GMAO
           </h3>
           <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Importez un nouvel export complet — les données existantes seront remplacées
+            Importez un fichier de nouvelles interventions — elles seront ajoutées au dataset existant
           </p>
         </div>
       </div>
@@ -108,10 +108,11 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
           📋 Comment ça fonctionne ?
         </p>
         <ul className="space-y-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
-          <li>• Exportez l'historique complet depuis votre GMAO (2003 → aujourd'hui)</li>
+          <li>• Exportez uniquement les <b>nouvelles interventions</b> depuis votre GMAO</li>
           <li>• Le fichier peut avoir le <b>nouveau format</b> (<code>date_declaration</code>, <code>equipment_code</code>...) ou <b>l'ancien format</b> (<code>WOWO_DECLARATION_DATE</code>...)</li>
-          <li>• Le format est <b>détecté automatiquement</b></li>
-          <li>• Les données sont remplacées et le pipeline est remis à zéro pour re-run</li>
+          <li>• Le format est <b>détecté automatiquement</b> et les colonnes sont normalisées</li>
+          <li>• Les nouvelles lignes sont <b>ajoutées</b> au failure existant (doublons supprimés)</li>
+          <li>• Le pipeline est remis à zéro → relancez EDA → Features → Preprocessing</li>
         </ul>
       </div>
 
@@ -170,7 +171,7 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
 
       {/* ── Résultat ── */}
       {result && (
-        <div className="rounded-xl border p-4 space-y-3"
+        <div className="rounded-xl border p-4 space-y-4"
           style={{ background: 'var(--bg-elevated)', borderColor: 'var(--success)' }}>
           <div className="flex items-center gap-2">
             <CheckCircle2 size={18} style={{ color: 'var(--success)' }} />
@@ -178,14 +179,22 @@ export default function UpdateData({ datasetId, currentDataset, onUpdated }) {
               Données mises à jour avec succès !
             </p>
           </div>
+
+          {/* Compteurs */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <CountBox label="Lignes existantes"  value={result.n_existing?.toLocaleString()}  color="var(--text-secondary)" />
+            <CountBox label="Nouvelles lignes"   value={`+${result.n_new?.toLocaleString()}`} color="var(--accent-blue)" />
+            <CountBox label="Doublons supprimés" value={result.n_duplicates?.toLocaleString() ?? '0'} color="var(--accent-orange)" />
+            <CountBox label="Total final"        value={result.n_total?.toLocaleString()}     color="var(--success)" />
+          </div>
+
           <div className="flex flex-wrap gap-4 pt-1">
-            <Stat icon={<FileText size={14}/>}  label="Lignes"   value={result.n_rows?.toLocaleString()} accent="success" />
             <Stat icon={<Calendar size={14}/>}  label="Nouvelle période"
               value={result.date_min ? `${result.date_min} → ${result.date_max}` : '—'} accent="success" />
             <Stat icon={<Database size={14}/>}  label="Format détecté"
               value={result.format === 'new' ? 'Nouveau format GMAO' : 'Format pipeline'} accent="success" />
           </div>
-          <p className="text-xs pt-1" style={{ color: 'var(--text-muted)' }}>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
             ⚠️ Le pipeline a été remis à zéro. Relancez EDA → Features → Preprocessing pour re-entraîner.
           </p>
         </div>
@@ -211,6 +220,16 @@ function Stat({ icon, label, value, accent }) {
         <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{label}</p>
         <p className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>{value}</p>
       </div>
+    </div>
+  );
+}
+
+function CountBox({ label, value, color }) {
+  return (
+    <div className="rounded-lg p-3 text-center"
+      style={{ background: 'var(--bg-card)', border: '1px solid var(--border-default)' }}>
+      <p className="text-lg font-bold font-mono" style={{ color }}>{value ?? '—'}</p>
+      <p className="text-xs mt-0.5" style={{ color: 'var(--text-muted)' }}>{label}</p>
     </div>
   );
 }

@@ -205,7 +205,7 @@ class CevitalPipeline:
                         if self.df_fail["WOWO_DECLARATION_DATE"].notna().any() else None,
             "date_max": self.df_fail["WOWO_DECLARATION_DATE"].max().isoformat()
                         if self.df_fail["WOWO_DECLARATION_DATE"].notna().any() else None,
-            "n_failures_year":  int((self.df_fail["annee"] == self.year).sum()),
+            "n_failures_year":  int((self.df_fail["annee"] >= self.year).sum()),
         }
 
     def compute_eda_raw(self) -> Dict:
@@ -218,7 +218,7 @@ class CevitalPipeline:
             raise RuntimeError("Charge d'abord les données avec load_raw_data()")
 
         df = self.df_fail
-        df23 = df[df["annee"] == self.year].copy()
+        df23 = df[df["annee"] >= self.year].copy()
         df34 = df23[df23["WOWO_EQUIPMENT_LEVEL"].isin([3.0, 4.0])].copy()
 
         # Labels métier des colonnes (notebook cell 6)
@@ -472,7 +472,7 @@ class CevitalPipeline:
 
         # ───────────────── ÉTAPE 2 : Filtrage année ─────────────────
         df_fail_year = df_fail[
-            df_fail["WOWO_DECLARATION_DATE"].dt.year == self.year
+            df_fail["WOWO_DECLARATION_DATE"].dt.year >= self.year
         ].copy()
 
         # 🆕 Diagnostic : distribution des niveaux d'équipement (toutes années)
@@ -595,9 +595,11 @@ class CevitalPipeline:
         })
 
         # ──────────── ÉTAPE 6 : Panel composant × jour ──────────────
+        max_date_data = fail_ok["WOWO_DECLARATION_DATE"].max()
+        timeline_end  = max_date_data if pd.notna(max_date_data) else pd.Timestamp(f"{self.year}-12-31")
         timeline = pd.date_range(
             start=f"{self.year}-01-01",
-            end  =f"{self.year}-12-31",
+            end  =timeline_end,
             freq ="D"
         )
 
@@ -643,7 +645,7 @@ class CevitalPipeline:
             if len(failure_dates) == 0:
                 return pd.DataFrame()
 
-            end_of_year = pd.Timestamp(f"{self.year}-12-31")
+            end_of_year = timeline_end
             ruls = []
             for _, row in df_comp.iterrows():
                 d = row["date"]
