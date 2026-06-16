@@ -156,9 +156,13 @@ class CevitalPipeline:
             'WOWO_EQUIPMENT_LEVEL': 'EREQ_LEVEL',
             'failure_parent_code':  'EREQ_PARENT_EQUIPMENT',
             'failure_parent_level': 'EREQ_PARENT_LEVEL',
+            'WOWO_DESCRIPTION':     'EREQ_DESCRIPTION',
         }
         avail = {k: v for k, v in equip_cols.items() if k in df_fail.columns}
         df_equip = df_fail[list(avail.keys())].drop_duplicates().rename(columns=avail)
+        # Garantir EREQ_DESCRIPTION même si absent du fichier source
+        if 'EREQ_DESCRIPTION' not in df_equip.columns:
+            df_equip['EREQ_DESCRIPTION'] = ''
 
         return df_fail, df_equip
 
