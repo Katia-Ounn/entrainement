@@ -109,6 +109,7 @@ export default function Leaderboard() {
         architecture: payload.architecture,
         mode:         payload.mode,
         name:         payload.name,
+        source_experiment_id: id,   // 🆕 pour le réentraînement "toutes les données" (meilleure époque)
       });
       toast.success(`Hyperparamètres chargés depuis "${payload.name || 'expérience'}"`);
     } catch (e) {

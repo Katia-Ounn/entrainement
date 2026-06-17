@@ -19,10 +19,14 @@ from tensorflow.keras.layers import (
     Embedding, Flatten, RepeatVector, Concatenate,
 )
 from tensorflow.keras import regularizers
-from tensorflow.keras.callbacks import EarlyStopping, Callback
+from tensorflow.keras.callbacks import EarlyStopping, Callback, ReduceLROnPlateau
 from sklearn.metrics import r2_score, mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
+import gc
 import keras_tuner as kt
+from skopt import gp_minimize
+from skopt.space import Real, Integer
+from skopt.utils import use_named_args
 
 
 # ─────────────────────────────────────────────────────────────
@@ -434,6 +438,18 @@ class PDMTuner:
 # └──────────────────────────────────────────────────────────────────┘
 # ═══════════════════════════════════════════════════════════════════════
 
+# Loss asymétrique — notebook PFE exact
+# sous-estimation (y_true > y_pred) → erreur ×4 (plus pénalisée)
+# sur-estimation  (y_true < y_pred) → erreur ×1 (poids de base)
+def asymmetric_rul_loss(y_true, y_pred):
+    error = y_true - y_pred
+    return tf.reduce_mean(tf.where(
+        error < 0,
+        tf.square(error) * 4.0,
+        tf.square(error) * 1.0,
+    ))
+
+
 def build_model_cevital_manual(
     architecture: str,
     lookback: int,
@@ -446,41 +462,43 @@ def build_model_cevital_manual(
     learning_rate: float,
 ):
     """
-    Construction MANUELLE d'un modèle Cevital (hyperparams fixes).
-    Architecture : 2 entrées (X_num, X_comp) + Embedding composant.
+    Architecture notebook PFE :
+      input_cat (lookback,) → Embedding → (lookback, embed_dim)
+      input_num (lookback, n_features)
+      → Concat axis=-1 → (lookback, embed_dim+n_features)
+      → LSTM/GRU → BatchNorm → Dropout → Dense(32,relu) → Dense(1,linear)
     """
     if architecture not in ("LSTM", "GRU"):
         raise ValueError(f"Architecture non supportée pour Cevital : {architecture}")
     LayerCls = LSTM if architecture == "LSTM" else GRU
 
+    from tensorflow.keras.layers import BatchNormalization
+
     input_num  = Input(shape=(lookback, n_features), name="input_num")
-    input_comp = Input(shape=(1,),                   name="input_comp")
+    input_comp = Input(shape=(lookback,),             name="input_comp")  # (lookback,)
 
-    # Embedding composant
-    emb     = Embedding(num_classes_comp, embedding_dim, name="comp_embedding")(input_comp)
-    emb     = Flatten(name="emb_flatten")(emb)
-    emb_seq = RepeatVector(lookback, name="emb_repeat")(emb)
+    x_emb = Embedding(num_classes_comp, embedding_dim, name="comp_embedding")(input_comp)
+    # x_emb : (batch, lookback, embed_dim)
+    x = Concatenate(axis=-1, name="concat_inputs")([x_emb, input_num])
+    # x    : (batch, lookback, embed_dim + n_features)
 
-    # Fusion (X_num + branche composant répétée)
-    x = Concatenate(name="concat_inputs")([input_num, emb_seq])
-
-    reg_val = 0.0001
     for i in range(num_layers):
         x = LayerCls(
             units=int(units[i]),
             return_sequences=(i < num_layers - 1),
-            kernel_regularizer=regularizers.l2(reg_val),
             name=f"{architecture.lower()}_{i+1}",
         )(x)
+        x = BatchNormalization(name=f"bn_{i+1}")(x)
         x = Dropout(rate=float(dropout_rates[i]), name=f"dropout_{i+1}")(x)
 
-    output = Dense(1, activation="relu", name="dense_rul")(x)
+    x      = Dense(32, activation="relu", name="dense_hidden")(x)
+    output = Dense(1,  activation="linear", name="dense_rul")(x)
 
     model = Model(inputs=[input_num, input_comp], outputs=output,
                   name=f"cevital_{architecture}")
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="mse",
+        loss=asymmetric_rul_loss,
         metrics=["mae"],
     )
     return model
@@ -501,43 +519,39 @@ def build_model_cevital_hp(
     lr_choices=(1e-3, 2e-3),
 ):
     """
-    Version pour keras_tuner — recherche embedding_dim, nb_layers, units, dropout, lr.
-    Reproduit la cellule 56 du notebook. Bornes par défaut = notebook PFE.
-
-    🆕 Toutes les bornes sont maintenant paramétrables depuis l'UI.
+    Version pour keras_tuner — même architecture que le notebook (BatchNorm, Dense(32), linear).
+    input_comp shape (lookback,) — X_cat notebook style.
     """
     if architecture not in ("LSTM", "GRU"):
         raise ValueError(f"Architecture non supportée : {architecture}")
     LayerCls = LSTM if architecture == "LSTM" else GRU
 
+    from tensorflow.keras.layers import BatchNormalization
+
     embedding_dim = hp.Choice("embedding_dim", list(embedding_search))
+    nb_layers     = hp.Int("nb_layers", int(nb_layers_min), int(nb_layers_max))
 
     input_num  = Input(shape=(lookback, n_features), name="input_num")
-    input_comp = Input(shape=(1,),                   name="input_comp")
+    input_comp = Input(shape=(lookback,),             name="input_comp")
 
-    emb     = Embedding(num_classes_comp, embedding_dim)(input_comp)
-    emb     = Flatten()(emb)
-    emb_seq = RepeatVector(lookback)(emb)
-
-    x = Concatenate()([input_num, emb_seq])
-
-    reg_val   = 0.0001
-    nb_layers = hp.Int("nb_layers", int(nb_layers_min), int(nb_layers_max))
+    x_emb = Embedding(num_classes_comp, embedding_dim)(input_comp)
+    x     = Concatenate(axis=-1)([x_emb, input_num])
 
     for i in range(nb_layers):
         x = LayerCls(
             units=hp.Int(f"u_{i}", units_search[0], units_search[1], step=units_search[2]),
             return_sequences=(i < nb_layers - 1),
-            kernel_regularizer=regularizers.l2(reg_val),
         )(x)
+        x = BatchNormalization()(x)
         x = Dropout(hp.Float(f"d_{i}", float(dropout_min), float(dropout_max)))(x)
 
-    output = Dense(1, activation="relu")(x)
+    x      = Dense(32, activation="relu")(x)
+    output = Dense(1,  activation="linear")(x)
 
     model = Model(inputs=[input_num, input_comp], outputs=output)
     model.compile(
         optimizer=keras.optimizers.Adam(hp.Choice("lr", list(lr_choices))),
-        loss="mse",
+        loss=asymmetric_rul_loss,
         metrics=["mae"],
     )
     return model
@@ -660,21 +674,23 @@ class CevitalTuner:
         await self._send({"type": "log",
                           "message": f"  Parametres : {model.count_params():,}"})
 
-        loop  = asyncio.get_event_loop()
-        cb_ws = WebSocketCallback(loop, self._send_fn, epochs)
-        cb_es = EarlyStopping(monitor="val_loss", patience=patience,
-                              restore_best_weights=True)
+        loop    = asyncio.get_event_loop()
+        cb_ws   = WebSocketCallback(loop, self._send_fn, epochs)
+        cb_es   = EarlyStopping(monitor="val_loss", patience=patience,
+                                restore_best_weights=True)
+        cb_rlr  = ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                    patience=4, min_lr=1e-6)
 
         history = await self._fit_in_thread(
             model,
             x_inputs       = [self.pipeline.X_train_num, self.pipeline.X_train_comp],
             y              = self.pipeline.y_train,
             sample_weight  = self.pipeline.w_train,
-            val_data       = ([self.pipeline.X_test_num, self.pipeline.X_test_comp],
-                              self.pipeline.y_test),
+            val_data       = ([self.pipeline.X_val_num, self.pipeline.X_val_comp],
+                              self.pipeline.y_val),
             epochs         = epochs,
             batch_size     = batch_size,
-            callbacks      = [cb_ws, cb_es],
+            callbacks      = [cb_ws, cb_es, cb_rlr],
         )
 
         duration = time.time() - start
@@ -719,150 +735,198 @@ class CevitalTuner:
             "y_pred":           y_pred_days.tolist(),
         }
 
-    # ─── ENTRAÎNEMENT AUTOML ──────────────────────────────────
+    # ─── ENTRAÎNEMENT AUTOML (gp_minimize + TimeSeriesSplit) ────────
     async def train_auto(
         self,
         architecture: str,
-        max_trials: int = 10,
-        epochs: int = 30,             # = époques PAR ESSAI bayésien
+        max_trials: int = 20,
+        epochs: int = 20,             # EPOCHS_CV — époques par fold CV (notebook : 20)
         batch_size: int = 32,
-        patience: int = 7,
+        patience: int = 4,            # patience EarlyStopping CV (notebook : 4)
         embedding_search=(4, 8, 16, 32),
-        # 🆕 bornes custom (défaut = notebook PFE)
-        units_min: int = 64,
+        units_min: int = 32,
         units_max: int = 128,
-        units_step: int = 32,
+        units_step: int = 32,         # ignoré — gp_minimize optimise en continu
         nb_layers_min: int = 1,
-        nb_layers_max: int = 2,
+        nb_layers_max: int = 1,
         dropout_min: float = 0.1,
-        dropout_max: float = 0.25,
-        lr_choices=(1e-3, 2e-3),
-        # 🆕 époques pour le RE-ENTRAÎNEMENT final du best model
-        # (notebook : tuner.search(epochs=12) puis model.fit(epochs=60))
-        final_epochs: int = 60,
+        dropout_max: float = 0.4,
+        lr_choices=(1e-4, 1e-2),
+        final_epochs: int = 35,       # EPOCHS_FIN (notebook exact)
     ) -> dict:
         await self._send({"type": "log",
-                          "message": f"🚀 AutoML Cevital {architecture} démarré — {max_trials} essais × {epochs} époques (recherche), puis {final_epochs} époques (entraînement final)"})
+                          "message": f"AutoML gp_minimize {architecture} — {max_trials} essais × CV 3 folds ({epochs} ep/fold), puis {final_epochs} ep (entraînement final)"})
         await self._send({"type": "log",
-                          "message": f"   Espace recherche : nb_layers ∈ [{nb_layers_min},{nb_layers_max}] · units ∈ [{units_min},{units_max}] step {units_step} · dropout ∈ [{dropout_min}, {dropout_max}] · lr ∈ {list(lr_choices)} · embedding_dim ∈ {list(embedding_search)}"})
+                          "message": f"   Espace : lstm_units ∈ [{units_min},{units_max}] · dropout ∈ [{dropout_min},{dropout_max}] · lr ∈ [{min(lr_choices):.1e},{max(lr_choices):.1e}] (log-uniform)"})
         start = time.time()
+        loop  = asyncio.get_event_loop()
 
-        tuner_dir = os.path.join(self.exports_dir, "kt_search", self.safe_name)
-        os.makedirs(tuner_dir, exist_ok=True)
+        # Paramètres fixes (non recherchés — notebook : 1 couche LSTM, embed médian)
+        embedding_dim = list(embedding_search)[len(embedding_search) // 2]
+        num_layers    = nb_layers_min
 
-        def hp_builder(hp):
-            return build_model_cevital_hp(
-                hp, architecture, self.lookback, self.n_features,
-                self.num_classes_comp,
-                embedding_search=embedding_search,
-                units_search=(units_min, units_max, units_step),
-                nb_layers_min=nb_layers_min, nb_layers_max=nb_layers_max,
-                dropout_min=dropout_min,     dropout_max=dropout_max,
-                lr_choices=lr_choices,
-            )
+        # ── Espace de recherche — notebook exact ─────────────────────
+        dimensions = [
+            Integer(units_min, units_max, name="lstm_units"),
+            Real(dropout_min,  dropout_max, name="dropout_rate"),
+            Real(min(lr_choices), max(lr_choices), "log-uniform", name="learning_rate"),
+        ]
 
-        loop      = asyncio.get_event_loop()
-        cb_ws     = WebSocketCallback(loop, self._send_fn, epochs)
-        cb_es     = EarlyStopping(monitor="val_loss", patience=patience,
-                                   restore_best_weights=True)
+        tscv        = TimeSeriesSplit(n_splits=3)
+        trial_state = {"n": 0, "best": None}
 
-        # 🆕 Sous-classe BayesianOptimization qui émet trial_start / trial_end
-        # vers le WebSocket → le frontend reçoit les events live de chaque essai.
-        send_fn      = self._send_fn
-        trial_state  = {"count": 0, "start": 0.0, "best_so_far": None}
+        # Copies locales pour la closure (accès thread-safe aux tableaux numpy)
+        X_train_num  = self.pipeline.X_train_num
+        X_train_comp = self.pipeline.X_train_comp
+        y_train      = self.pipeline.y_train
+        w_train      = self.pipeline.w_train
+        scaler_y     = self.pipeline.scaler_y
+        max_rul      = self.pipeline.current_max_rul
 
-        class WSBayesianOptimization(kt.BayesianOptimization):
-            def on_trial_begin(self, trial):
-                trial_state["count"] += 1
-                trial_state["start"] = time.time()
-                coro = send_fn({
-                    "type":  "trial_start",
-                    "trial": trial_state["count"],
-                    "total": max_trials,
-                })
-                try:
-                    asyncio.run_coroutine_threadsafe(coro, loop)
-                except Exception:
-                    pass
-                if hasattr(super(), "on_trial_begin"):
-                    super().on_trial_begin(trial)
+        # ── Fonction objectif — CV walk-forward (notebook exact) ─────
+        @use_named_args(dimensions)
+        def objective(lstm_units, dropout_rate, learning_rate):
+            trial_state["n"] += 1
+            n = trial_state["n"]
 
-            def on_trial_end(self, trial):
-                trial_duration = round(time.time() - trial_state["start"], 1)
-                try:
-                    score = float(trial.score) if trial.score is not None else None
-                except Exception:
-                    score = None
-                if score is not None and (trial_state["best_so_far"] is None or score < trial_state["best_so_far"]):
-                    trial_state["best_so_far"] = score
-                coro = send_fn({
-                    "type":         "trial_end",
-                    "trial":        trial_state["count"],
-                    "avg_cv_loss":  score,
-                    "duration":     trial_duration,
-                    "best_so_far":  trial_state["best_so_far"],
-                })
-                try:
-                    asyncio.run_coroutine_threadsafe(coro, loop)
-                except Exception:
-                    pass
-                if hasattr(super(), "on_trial_end"):
-                    super().on_trial_end(trial)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_fn({"type": "trial_start", "trial": n, "total": max_trials}),
+                    loop,
+                )
+            except Exception:
+                pass
 
-        tuner = WSBayesianOptimization(
-            hp_builder,
-            objective="val_loss",
-            max_trials=max_trials,
-            directory=tuner_dir,
-            project_name=self.safe_name,
-            overwrite=True,
-        )
+            t_trial   = time.time()
+            fold_maes = []
 
-        def _blocking_search():
-            tuner.search(
-                [self.pipeline.X_train_num, self.pipeline.X_train_comp],
-                self.pipeline.y_train,
-                sample_weight=self.pipeline.w_train,
-                validation_data=([self.pipeline.X_test_num, self.pipeline.X_test_comp],
-                                  self.pipeline.y_test),
-                epochs=epochs,
-                batch_size=batch_size,
-                callbacks=[cb_ws, cb_es],
-                verbose=0,
+            for _, (tr_idx, val_idx) in enumerate(tscv.split(X_train_num)):
+                tf.keras.backend.clear_session()
+                gc.collect()
+
+                model_fold = build_model_cevital_manual(
+                    architecture     = architecture,
+                    lookback         = self.lookback,
+                    n_features       = self.n_features,
+                    num_classes_comp = self.num_classes_comp,
+                    embedding_dim    = int(embedding_dim),
+                    num_layers       = num_layers,
+                    units            = [int(lstm_units)] * num_layers,
+                    dropout_rates    = [float(dropout_rate)] * num_layers,
+                    learning_rate    = float(learning_rate),
+                )
+
+                model_fold.fit(
+                    [X_train_num[tr_idx], X_train_comp[tr_idx]],
+                    y_train[tr_idx],
+                    sample_weight   = w_train[tr_idx],
+                    validation_data = (
+                        [X_train_num[val_idx], X_train_comp[val_idx]],
+                        y_train[val_idx],
+                    ),
+                    epochs     = epochs,
+                    batch_size = batch_size,
+                    verbose    = 0,
+                    callbacks  = [
+                        EarlyStopping(monitor="val_loss", patience=patience,
+                                      restore_best_weights=True),
+                    ],
+                )
+
+                preds   = model_fold.predict(
+                    [X_train_num[val_idx], X_train_comp[val_idx]], verbose=0
+                ).flatten()
+                preds_d = np.clip(
+                    scaler_y.inverse_transform(preds.reshape(-1, 1)).flatten(), 0, max_rul
+                )
+                true_d  = scaler_y.inverse_transform(
+                    y_train[val_idx].reshape(-1, 1)
+                ).flatten()
+                fold_maes.append(mean_absolute_error(true_d, preds_d))
+
+                del model_fold
+                tf.keras.backend.clear_session()
+                gc.collect()
+
+            cv_mae = float(np.mean(fold_maes))
+
+            if trial_state["best"] is None or cv_mae < trial_state["best"]:
+                trial_state["best"] = cv_mae
+
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_fn({
+                        "type":        "trial_end",
+                        "trial":       n,
+                        "avg_cv_loss": round(cv_mae, 4),
+                        "duration":    round(time.time() - t_trial, 1),
+                        "best_so_far": round(trial_state["best"], 4),
+                    }),
+                    loop,
+                )
+            except Exception:
+                pass
+
+            return cv_mae
+
+        # ── gp_minimize dans un thread (ne bloque pas l'event loop) ──
+        def _blocking_gp():
+            return gp_minimize(
+                objective,
+                dimensions,
+                n_calls=max_trials,
+                random_state=42,
+                n_jobs=1,
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            await loop.run_in_executor(executor, _blocking_search)
+            res_gp = await loop.run_in_executor(executor, _blocking_gp)
 
-        best_hps = tuner.get_best_hyperparameters(1)[0]
+        best = {
+            "lstm_units":    int(res_gp.x[0]),
+            "dropout_rate":  float(res_gp.x[1]),
+            "learning_rate": float(res_gp.x[2]),
+        }
         await self._send({"type": "log",
-                          "message": f"🏆 Recherche terminée. Meilleurs hyperparams : {dict(best_hps.values)}"})
+                          "message": f"Recherche terminée. Meilleurs params : {best}"})
 
-        # ── 🆕 RE-ENTRAÎNEMENT FINAL avec final_epochs (notebook cell 61) ──
-        # Le notebook fait : tuner.search(epochs=12) puis model.fit(epochs=60)
-        # On reproduit cette logique : on rebuild le modèle avec best_hps et on
-        # l'entraîne plus longtemps pour mieux exploiter l'architecture trouvée.
+        # ── Entraînement final — notebook exact (EPOCHS_FIN=35, batch=64) ──
         await self._send({"type": "log",
-                          "message": f"🔁 Entraînement final du best model — {final_epochs} époques (early stopping patience={patience})"})
+                          "message": f"Entraînement final — {final_epochs} époques (EarlyStopping patience=6 + ReduceLROnPlateau factor=0.5)"})
 
-        best_model = tuner.hypermodel.build(best_hps)
-        cb_ws_final = WebSocketCallback(loop, self._send_fn, final_epochs)
-        cb_es_final = EarlyStopping(monitor="val_loss", patience=patience,
-                                     restore_best_weights=True)
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        best_model = build_model_cevital_manual(
+            architecture     = architecture,
+            lookback         = self.lookback,
+            n_features       = self.n_features,
+            num_classes_comp = self.num_classes_comp,
+            embedding_dim    = int(embedding_dim),
+            num_layers       = num_layers,
+            units            = [best["lstm_units"]] * num_layers,
+            dropout_rates    = [best["dropout_rate"]] * num_layers,
+            learning_rate    = best["learning_rate"],
+        )
+
+        cb_ws_final  = WebSocketCallback(loop, self._send_fn, final_epochs)
+        cb_es_final  = EarlyStopping(monitor="val_loss", patience=6,
+                                      restore_best_weights=True)
+        cb_rlr_final = ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                                          patience=4, min_lr=1e-6)
 
         history_final = await self._fit_in_thread(
             best_model,
-            x_inputs       = [self.pipeline.X_train_num, self.pipeline.X_train_comp],
-            y              = self.pipeline.y_train,
-            sample_weight  = self.pipeline.w_train,
-            val_data       = ([self.pipeline.X_test_num, self.pipeline.X_test_comp],
-                              self.pipeline.y_test),
-            epochs         = final_epochs,
-            batch_size     = batch_size,
-            callbacks      = [cb_ws_final, cb_es_final],
+            x_inputs      = [self.pipeline.X_train_num, self.pipeline.X_train_comp],
+            y             = self.pipeline.y_train,
+            sample_weight = self.pipeline.w_train,
+            val_data      = ([self.pipeline.X_val_num, self.pipeline.X_val_comp],
+                              self.pipeline.y_val),
+            epochs        = final_epochs,
+            batch_size    = 64,
+            callbacks     = [cb_ws_final, cb_es_final, cb_rlr_final],
         )
 
-        # Historique du training final (pour les courbes Loss/MAE du Leaderboard)
         hist = history_final.history
         training_history = [
             {
@@ -892,16 +956,16 @@ class CevitalTuner:
             "rmse":     round(metrics["rmse"], 3),
             "mape":     round(metrics["mape"], 2),
             "duration": round(duration, 1),
-            "message":  f"\nAutoML termine | R2={metrics['r2']:.4f} | MAE={metrics['mae']:.2f}j",
+            "message":  f"\nAutoML terminé | R2={metrics['r2']:.4f} | MAE={metrics['mae']:.2f}j",
         })
 
         return {
             "model":            best_model,
-            "best_hps":         best_hps.values,
+            "best_hps":         best,
             "metrics":          metrics,
             "duration_sec":     duration,
             "total_trials":     max_trials,
-            "training_history": training_history,   # 🆕 courbes du training final
+            "training_history": training_history,
             "y_true":           y_true_days.tolist(),
             "y_pred":           y_pred_days.tolist(),
         }

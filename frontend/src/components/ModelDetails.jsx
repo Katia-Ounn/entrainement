@@ -19,6 +19,8 @@ import {
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Legend, PieChart, Pie, Cell,
+  ScatterChart, Scatter, ReferenceLine,
+  ComposedChart, Bar, Area,
 } from 'recharts';
 import ScatterWithZones from './charts/ScatterWithZones';
 
@@ -50,13 +52,24 @@ export default function ModelDetails({
   }, [experiment?.id]);
 
   const exp = details || experiment;
-  const tabs = [
-    { id: 'regression',     label: '📈 Régression',      icon: TrendingUp },
-    { id: 'classification', label: '🎯 Classification',  icon: Target },
-    { id: 'training',       label: '📊 Apprentissage',   icon: Activity },
-    { id: 'predictions',    label: '🔮 Prédictions',     icon: Calendar },
-    { id: 'config',         label: '⚙️ Config',          icon: Settings },
-  ];
+  const isFull = exp.mode === 'full';   // modèle de déploiement (réentraîné sur 100% des données)
+  // Modèle full → on masque Classification + Prédictions (évaluation sur données
+  // déjà vues = trompeur) et on montre un onglet "Prédiction panne future".
+  const tabs = isFull
+    ? [
+        { id: 'next_failure', label: '🔮 Prédiction panne future', icon: Calendar },
+        { id: 'training',     label: '📊 Apprentissage',           icon: Activity },
+        { id: 'config',       label: '⚙️ Config',                  icon: Settings },
+      ]
+    : [
+        { id: 'regression',     label: '📈 Régression',      icon: TrendingUp },
+        { id: 'classification', label: '🎯 Classification',  icon: Target },
+        { id: 'training',       label: '📊 Apprentissage',   icon: Activity },
+        { id: 'predictions',    label: '🔮 Prédictions',     icon: Calendar },
+        { id: 'config',         label: '⚙️ Config',          icon: Settings },
+      ];
+  // Si l'onglet actif n'existe pas pour ce type de modèle → on retombe sur le 1er.
+  const safeTab = tabs.some(t => t.id === activeTab) ? activeTab : tabs[0].id;
 
   const handleDownloadZip = () => {
     window.open(`${API}/api/experiments/${experiment.id}/export`, '_blank');
@@ -96,7 +109,7 @@ export default function ModelDetails({
           }}>
           {tabs.map(tab => {
             const Icon = tab.icon;
-            const isActive = activeTab === tab.id;
+            const isActive = safeTab === tab.id;
             return (
               <button key={tab.id} onClick={() => setActiveTab(tab.id)}
                 className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded text-xs font-semibold transition-all"
@@ -134,11 +147,20 @@ export default function ModelDetails({
         )}
         {!loading && !error && (
           <>
-            {activeTab === 'regression'     && <RegressionTab exp={exp}/>}
-            {activeTab === 'classification' && <ClassificationTab exp={exp} experimentId={experiment.id}/>}
-            {activeTab === 'training'       && <TrainingTab exp={exp}/>}
-            {activeTab === 'predictions'    && <PredictionsTab exp={exp}/>}
-            {activeTab === 'config'         && <ConfigTab exp={exp}/>}
+            {safeTab === 'regression'     && <RegressionTab exp={exp}/>}
+            {safeTab === 'classification' && <ClassificationTab exp={exp} experimentId={experiment.id}/>}
+            {safeTab === 'training'       && <TrainingTab exp={exp}/>}
+            {safeTab === 'predictions'    && <PredictionsTab exp={exp}/>}
+            {safeTab === 'next_failure'   && (
+              <div>
+                <p className="text-xs mb-3" style={{ color:'var(--text-tertiary)' }}>
+                  La prochaine panne <b>à venir</b> pour chaque composant (modèle déployé sur 100% des données).
+                  C'est le futur → il n'y a <b>pas</b> de valeur réelle à comparer.
+                </p>
+                <NextFailuresView expId={experiment.id} />
+              </div>
+            )}
+            {safeTab === 'config'         && <ConfigTab exp={exp}/>}
           </>
         )}
       </div>
@@ -513,6 +535,168 @@ function TrainingTab({ exp }) {
 // 🔮 Onglet Prédictions (filtre composant + table)
 // ═══════════════════════════════════════════════════════════════
 function PredictionsTab({ exp }) {
+  return (
+    <div className="space-y-6">
+
+      {/* ── SECTION 1 : prédiction du FUTUR (pas de valeur réelle) ── */}
+      <div>
+        <h3 className="text-sm font-bold mb-1" style={{ color:'var(--text-primary)' }}>
+          🔮 Prédiction du futur — Prochaine panne
+        </h3>
+        <p className="text-xs mb-3" style={{ color:'var(--text-tertiary)' }}>
+          La prochaine panne <b>à venir</b> pour chaque composant. C'est le futur → il n'y a <b>pas</b> de valeur réelle à comparer.
+        </p>
+        <NextFailuresView expId={exp.id} />
+      </div>
+
+      {/* ── SECTION 2 : évaluation sur le PASSÉ (vérité connue) ── */}
+      <div>
+        <h3 className="text-sm font-bold mb-1" style={{ color:'var(--text-primary)' }}>
+          📊 Évaluation du modèle — sur données passées
+        </h3>
+        <p className="text-xs mb-3" style={{ color:'var(--text-tertiary)' }}>
+          Compare le <b>RUL réel</b> (connu, car historique) au <b>RUL prédit</b> pour mesurer la précision —
+          ce n'est <b>pas</b> une prédiction du futur. ⚠️ Ce modèle étant entraîné sur ces données, les scores sont optimistes.
+        </p>
+        <PredictionsTable exp={exp} />
+      </div>
+
+    </div>
+  );
+}
+
+// Prédiction de la PROCHAINE panne par composant (inférence de déploiement)
+function NextFailuresView({ expId }) {
+  const [data, setData]         = useState(null);
+  const [err, setErr]           = useState(null);
+  const [loading, setLoading]   = useState(true);
+  const [selected, setSelected] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true); setErr(null);
+    fetch(`${API}/api/experiments/${expId}/next_failures`)
+      .then(r => r.json().then(b => (r.ok ? b : Promise.reject(b.detail || 'Erreur'))))
+      .then(d => { if (!alive) return; setData(d); setSelected(d.components?.[0]?.comp || ''); })
+      .catch(e => { if (alive) setErr(typeof e === 'string' ? e : 'Erreur de prédiction'); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [expId]);
+
+  if (loading) return (
+    <div className="rounded-xl border p-4 flex items-center gap-2"
+      style={{ background:'var(--bg-card)', borderColor:'var(--border-default)', color:'var(--text-tertiary)' }}>
+      <Loader size={16} className="animate-spin"/> Calcul des prédictions de prochaine panne…
+    </div>
+  );
+  if (err)  return <EmptyHint text={`Prédiction de prochaine panne indisponible : ${err}`} />;
+  if (!data?.components?.length) return <EmptyHint text="Aucune prédiction de prochaine panne disponible." />;
+
+  const comps   = data.components;
+  const sel     = comps.find(c => c.comp === selected) || comps[0];
+  const todayTs = new Date(data.data_end).getTime();
+  const urgency = (rul) => rul <= 7 ? 'var(--error)' : rul <= 21 ? 'var(--accent-orange)' : 'var(--success)';
+
+  // Données du graphe combiné : barres = pannes · courbe (aire) = RUL restant
+  const maxRul = data.max_rul || 30;
+  const predTs = new Date(sel.predicted_next_failure).getTime();
+  const chartData = [
+    ...(sel.past_failures || [])
+      .map(d => ({ x: new Date(d).getTime(), failPast: maxRul, date: d, kind: 'Panne passée' }))
+      .filter(p => !Number.isNaN(p.x)),
+    { x: todayTs, rul: sel.predicted_rul, date: data.data_end, kind: "Aujourd'hui" },
+    { x: predTs,  failPred: maxRul, rul: 0, date: sel.predicted_next_failure, kind: 'Prochaine panne (prédite)' },
+  ].sort((a, b) => a.x - b.x);
+
+  const xsAll = chartData.map(p => p.x).filter(v => !Number.isNaN(v));
+  const xmin  = Math.min(...xsAll), xmax = Math.max(...xsAll);
+  const pad   = (xmax - xmin) * 0.05 || 86400000;
+
+  return (
+    <div className="rounded-xl border p-4 space-y-3"
+      style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <p className="text-sm font-semibold" style={{ color:'var(--text-primary)' }}>
+          🔮 Prochaine panne prédite par composant
+        </p>
+        <span className="text-[11px] font-mono" style={{ color:'var(--text-muted)' }}>
+          {data.n} composants · jusqu'au {data.data_end} · RUL ≤ {data.max_rul}j
+        </span>
+      </div>
+
+      {/* Sélecteur composant (trié par urgence) */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <label className="text-xs font-semibold" style={{ color:'var(--text-tertiary)' }}>Composant :</label>
+        <select value={sel.comp} onChange={e => setSelected(e.target.value)}
+          className="px-2 py-1 rounded text-xs font-mono border outline-none"
+          style={{ background:'var(--bg-elevated)', borderColor:'var(--border-default)', color:'var(--text-primary)' }}>
+          {comps.map(c => (
+            <option key={c.comp} value={c.comp}>{c.comp} — dans {c.predicted_rul}j</option>
+          ))}
+        </select>
+      </div>
+
+      {/* Stat prochaine panne */}
+      <div className="flex items-center gap-6 flex-wrap">
+        <div>
+          <p className="text-[11px]" style={{ color:'var(--text-tertiary)' }}>Prochaine panne prédite</p>
+          <p className="text-lg font-bold" style={{ color: urgency(sel.predicted_rul) }}>
+            {sel.predicted_next_failure}
+            <span className="text-xs font-mono ml-1">(dans {sel.predicted_rul} j)</span>
+          </p>
+        </div>
+        <div>
+          <p className="text-[11px]" style={{ color:'var(--text-tertiary)' }}>Pannes passées</p>
+          <p className="text-sm font-mono" style={{ color:'var(--text-secondary)' }}>{sel.n_failures}</p>
+        </div>
+      </div>
+
+      {/* Graphe combiné : barres = pannes (gris passées / rouge prédite) · courbe = RUL restant */}
+      <ResponsiveContainer width="100%" height={180}>
+        <ComposedChart data={chartData} margin={{ top: 12, right: 24, bottom: 18, left: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border-default)" />
+          <XAxis type="number" dataKey="x" scale="time" domain={[xmin - pad, xmax + pad]}
+            tickFormatter={(t) => new Date(t).toISOString().slice(0, 10)}
+            tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }} />
+          <YAxis domain={[0, maxRul]} allowDecimals={false}
+            tick={{ fontSize: 10, fill: 'var(--text-tertiary)' }}
+            label={{ value: 'RUL (j)', angle: -90, position: 'insideLeft', fontSize: 10, fill: 'var(--text-tertiary)' }} />
+          <Tooltip
+            content={({ active, payload }) => {
+              if (!active || !payload?.length) return null;
+              const p = payload[0].payload;
+              return (
+                <div style={{ background:'var(--bg-elevated)', border:'1px solid var(--border-default)', borderRadius:6, padding:'6px 8px', fontSize:11 }}>
+                  <div style={{ color:'var(--text-primary)', fontWeight:600 }}>{p.date}</div>
+                  <div style={{ color:'var(--text-tertiary)' }}>{p.kind}</div>
+                  {p.rul != null && <div style={{ color:'var(--accent-orange)' }}>RUL : {p.rul} j</div>}
+                </div>
+              );
+            }} />
+          <ReferenceLine x={todayTs} stroke="var(--text-muted)" strokeDasharray="4 4"
+            label={{ value: "aujourd'hui", fontSize: 9, fill: 'var(--text-muted)', position: 'insideTopRight' }} />
+          <Bar dataKey="failPast" name="Pannes passées"   fill="var(--text-secondary)" barSize={12} radius={[2,2,0,0]} />
+          <Bar dataKey="failPred" name="Prochaine panne"  fill="var(--error)"          barSize={12} radius={[2,2,0,0]} />
+          <Area type="monotone" dataKey="rul" name="RUL restant (j)"
+            stroke="var(--accent-orange)" fill="var(--accent-orange)" fillOpacity={0.18}
+            strokeWidth={2} connectNulls dot={{ r: 3, fill: 'var(--accent-orange)' }} />
+        </ComposedChart>
+      </ResponsiveContainer>
+      <div className="flex items-center gap-4 text-[11px] flex-wrap" style={{ color:'var(--text-tertiary)' }}>
+        <span style={{ color:'var(--text-secondary)' }}>▮ Pannes passées</span>
+        <span style={{ color:'var(--error)' }}>▮ Prochaine panne prédite</span>
+        <span style={{ color:'var(--accent-orange)' }}>▬ RUL restant (courbe)</span>
+        <span>┊ aujourd'hui ({data.data_end})</span>
+      </div>
+      <p className="text-[11px]" style={{ color:'var(--text-muted)' }}>
+        ℹ️ Le RUL est plafonné à {data.max_rul} jours → les prédictions ne dépassent pas {data.max_rul}j.
+      </p>
+    </div>
+  );
+}
+
+// Tableau d'évaluation réel vs prédit (sur le jeu de test)
+function PredictionsTable({ exp }) {
   const preds = exp.predictions;
   const [filter, setFilter] = useState('all');
 

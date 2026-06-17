@@ -1,13 +1,12 @@
 /**
  * Preprocessing.jsx — Sous-onglet 4 ⭐ Pédagogique pour jury.
  *
- *   Structure en 5 sections claires (chacune avec titre + explication) :
+ *   Structure en 5 sections (chacune avec titre + explication) :
  *     1. ⚙️ Configuration des paramètres
- *     2. ⚖️ Équilibrage sain / dégradé
- *     3. 🔪 Split par composant (train/test)
- *     4. 📏 Normalisation MinMax (AVANT / APRÈS côte-à-côte)
- *     5. 🧱 Séquençage temporel (visualisation t=0 → t=lookback)
- *     6. ⚖️ Poids d'entraînement (histogramme + stats)
+ *     2. 🔪 Split temporel par date (Train 70% / Val 15% / Test 15%)
+ *     3. 📏 Normalisation MinMax (AVANT / APRÈS côte-à-côte)
+ *     4. 🧱 Séquençage temporel (visualisation t=0 → t=lookback)
+ *     5. ⚖️ Poids d'entraînement — formule notebook w=1+factor×(1−RUL/MAX_RUL)
  *
  *   Tout est expliqué inline → le jury comprend SANS commentaire externe.
  */
@@ -26,21 +25,20 @@ import { useApp } from '../../AppContext';
 
 const API = 'http://localhost:8000';
 
-const LOOKBACK_PRESETS     = [7, 14, 30, 60, 90];
-const MAX_RUL_PRESETS      = [10, 20, 30, 60, 90];
-const WEIGHT_PRESETS       = [5, 10, 15, 20];
-const TEST_RATIO_PRESETS   = [0.10, 0.15, 0.20, 0.25];
-const HEALTHY_FRAC_PRESETS = [0.10, 0.20, 0.30, 0.50];
+const LOOKBACK_PRESETS = [7, 14, 17, 21, 30, 60, 90];
+const MAX_RUL_PRESETS  = [10, 20, 30, 60, 90];
+// holdoutRatio = val_ratio = test_ratio → train = 1 - 2 × holdout
+const HOLDOUT_PRESETS  = [0.10, 0.15, 0.20];
+// weight_factor : w = 1 + factor × (1 − RUL/MAX_RUL)  — notebook PFE
+const WEIGHT_PRESETS   = [2, 4, 6, 8];
 
 
-// Ordre + label des étapes du backend (doit matcher prepare_sequences progress events)
 const STEP_ORDER = [
-  { id: 'config',    label: 'Configuration' },
-  { id: 'balance',   label: 'Équilibrage' },
-  { id: 'split',     label: 'Split par composant' },
-  { id: 'normalize', label: 'Normalisation MinMax' },
-  { id: 'sequence',  label: 'Séquençage temporel' },
-  { id: 'weights',   label: 'Poids d’entraînement' },
+  { id: "config",    label: "Configuration" },
+  { id: "split",     label: "Split temporel" },
+  { id: "normalize", label: "Normalisation MinMax" },
+  { id: "sequence",  label: "Sequencage temporel" },
+  { id: "weights",   label: "Poids entrainement" },
 ];
 
 
@@ -48,11 +46,10 @@ export default function Preprocessing({ datasetId, onCompleted }) {
   const { preprocResult, setPreprocResult, markPrepStep, selectedFeatures,
           bumpDatasetVersion } = useApp();
 
-  const [lookback,         setLookback]      = useState(preprocResult?.lookback        ?? 30);
-  const [currentMaxRul,    setCurrentMaxRul] = useState(preprocResult?.current_max_rul ?? 30);
-  const [weightFactor,     setWeightFactor]  = useState(15);
-  const [testRatio,        setTestRatio]     = useState(0.20);
-  const [healthyFrac,      setHealthyFrac]   = useState(0.30);
+  const [lookback,      setLookback]      = useState(preprocResult?.lookback        ?? 21);
+  const [currentMaxRul, setCurrentMaxRul] = useState(preprocResult?.current_max_rul ?? 30);
+  const [weightFactor,  setWeightFactor]  = useState(preprocResult?.weight_factor   ?? 4);
+  const [holdoutRatio,  setHoldoutRatio]  = useState(preprocResult?.val_ratio       ?? 0.15);
 
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState(null);
@@ -80,11 +77,11 @@ export default function Preprocessing({ datasetId, onCompleted }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           lookback,
-          current_max_rul:     currentMaxRul,
-          weight_factor:       weightFactor,
-          test_ratio:          testRatio,
-          healthy_sample_frac: healthyFrac,
-          feature_cols:        selectedFeatures,
+          current_max_rul: currentMaxRul,
+          weight_factor:   weightFactor,
+          val_ratio:       holdoutRatio,
+          test_ratio:      holdoutRatio,
+          feature_cols:    selectedFeatures,
         }),
       });
       if (!res.ok) {
@@ -234,36 +231,25 @@ export default function Preprocessing({ datasetId, onCompleted }) {
           <ConfigCard
             icon={Weight} color="var(--accent-orange)"
             title="Weight Factor — poids RUL faibles"
-            description="Multiplicateur dans la formule des sample_weights. Plus haut = le modèle est PUNI plus fort quand il rate une panne imminente."
-            example={`Formule : w = 1 + (1 − y_norm) × ${weightFactor}. RUL=0 → w=${1 + Number(weightFactor)} · RUL=max → w=1.`}
+            description="Facteur dans la formule notebook : w = 1 + factor×(1−RUL/MAX_RUL). Défaut=4 (notebook PFE). Plus haut = le modèle punit davantage les erreurs proches de la panne."
+            example={`Formule notebook : w = 1 + ${weightFactor}×(1−RUL/${currentMaxRul}). RUL=0 → w=${(1 + Number(weightFactor)).toFixed(1)} · RUL=max → w=1.`}
             unit="×" presets={WEIGHT_PRESETS}
             value={weightFactor} onChange={setWeightFactor}
-            min={0} max={100}
+            min={0} max={20}
           />
 
           <ConfigCard
             icon={Percent} color="var(--accent-green)"
-            title="Test ratio — proportion test"
-            description="Sur 100 composants, X% mis de côté pour évaluer le modèle. Split PAR COMPOSANT (pas par ligne) — chaque composant est 100% train ou 100% test."
-            example={`Ratio=${Math.round(testRatio * 100)}% : sur 164 composants → ${Math.round(164 * testRatio)} en test, ${Math.round(164 * (1 - testRatio))} en train.`}
+            title="Split temporel — val + test holdout"
+            description="Split PAR PLAGE DE DATES (chronologique). Les données les plus récentes vont en val puis test. Val et test ont le même ratio. Train = 1 − 2 × holdout."
+            example={`Holdout=${Math.round(holdoutRatio * 100)}% → Train ${Math.round((1 - 2 * holdoutRatio) * 100)}% / Val ${Math.round(holdoutRatio * 100)}% / Test ${Math.round(holdoutRatio * 100)}%`}
             unit="" presetSuffix="%"
-            presets={TEST_RATIO_PRESETS}
-            value={testRatio} onChange={setTestRatio}
-            min={0.05} max={0.5} step={0.05}
+            presets={HOLDOUT_PRESETS}
+            value={holdoutRatio} onChange={setHoldoutRatio}
+            min={0.05} max={0.35} step={0.05}
             formatPreset={(v) => `${Math.round(v * 100)}`}
           />
 
-          <ConfigCard
-            icon={Filter} color="var(--accent-pink)"
-            title="Sample-frac sain — équilibrage classe"
-            description="Le dataset a ÉNORMÉMENT de jours sains (RUL=max) vs peu de jours dégradés. On garde X% des sains et 100% des dégradés → modèle apprend la zone critique."
-            example={`Frac=${Math.round(healthyFrac * 100)}% : garde 1 jour sain sur ${Math.round(1 / healthyFrac)}, tous les dégradés.`}
-            unit="" presetSuffix="%"
-            presets={HEALTHY_FRAC_PRESETS}
-            value={healthyFrac} onChange={setHealthyFrac}
-            min={0.05} max={1.0} step={0.05}
-            formatPreset={(v) => `${Math.round(v * 100)}`}
-          />
         </div>
 
         <button
@@ -329,64 +315,47 @@ export default function Preprocessing({ datasetId, onCompleted }) {
             color:       'var(--text-tertiary)',
           }}>
           👆 Configure tes paramètres puis clique sur <b>Lancer le prétraitement</b>.
-          Les 5 étapes apparaîtront ici (équilibrage, split, normalisation, séquençage, poids).
+          Les 5 étapes apparaîtront ici (config, split, normalisation, séquençage, poids).
         </div>
       )}
 
       {preprocResult && (
         <>
-          {/* ═══════ Section 2 : Équilibrage ═══════ */}
-          {isReady('balance') &&
-          (
-          <Section
-            icon={Scale} color="var(--accent-pink)"
-            title="⚖️ Étape 2 — Équilibrage sain / dégradé"
-            description={`Le Dataset_V1 brut contient majoritairement des jours sains (RUL ≥ ${currentMaxRul}). On garde ${Math.round(healthyFrac * 100)}% des sains et 100% des dégradés → réduit le déséquilibre de classe.`}>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <BalanceCard
-                label="📊 Train (après équilibrage)"
-                value={preprocResult.n_train_rows_after_balance || preprocResult.X_train_num_shape?.[0]}
-                detail={`${preprocResult.n_train_comps} composants × jours équilibrés`}
-                color="var(--accent-blue)"
-              />
-              <BalanceCard
-                label="📊 Test (après équilibrage)"
-                value={preprocResult.n_test_rows_after_balance || preprocResult.X_test_num_shape?.[0]}
-                detail={`${preprocResult.n_test_comps} composants × jours équilibrés`}
-                color="var(--accent-green)"
-              />
-            </div>
-          </Section>
-          )}
-
-          {/* ═══════ Section 3 : Split par composant ═══════ */}
+          {/* ═══════ Section 2 : Split temporel ═══════ */}
           {isReady('split') && (
           <Section
             icon={Scissors} color="var(--accent-green)"
-            title="🔪 Étape 3 — Split par composant"
-            description="Les composants sont mélangés (seed=42) puis le premier (1-test_ratio)% va en train, le reste en test. CHAQUE composant est entièrement dans un set : pas de fuite temporelle.">
+            title="🔪 Étape 3 — Split temporel par date"
+            description="Les données sont triées par date. Les plus anciennes → Train. Les suivantes → Validation. Les plus récentes → Test. Respecte la chronologie réelle.">
 
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-3 gap-4 mb-3">
               <SplitVisualBar
-                label="Train" pct={Math.round((1 - testRatio) * 100)}
-                count={preprocResult.n_train_comps}
+                label="Train" pct={Math.round((1 - 2 * holdoutRatio) * 100)}
+                count={preprocResult.n_train_rows}
                 color="var(--accent-blue)"
+                dateEnd={preprocResult.train_date_end}
               />
               <SplitVisualBar
-                label="Test" pct={Math.round(testRatio * 100)}
-                count={preprocResult.n_test_comps}
+                label="Validation" pct={Math.round(holdoutRatio * 100)}
+                count={preprocResult.n_val_rows}
+                color="var(--accent-purple)"
+                dateEnd={preprocResult.val_date_end}
+              />
+              <SplitVisualBar
+                label="Test" pct={Math.round(holdoutRatio * 100)}
+                count={preprocResult.n_test_rows}
                 color="var(--accent-green)"
+                dateEnd={preprocResult.test_date_end}
               />
             </div>
           </Section>
           )}
 
-          {/* ═══════ Section 4 : Normalisation AVANT / APRÈS ═══════ */}
+          {/* ═══════ Section 3 : Normalisation AVANT / APRÈS ═══════ */}
           {isReady('normalize') && (
           <Section
             icon={Ruler} color="var(--accent-orange)"
-            title="📏 Étape 4 — Normalisation MinMax"
+            title="📏 Étape 3 — Normalisation MinMax"
             description="MinMaxScaler transforme chaque feature [min, max] → [0, 1]. Le LSTM converge mieux avec des inputs normalisés. Le scaler est FITTÉ sur train uniquement (pas de leak).">
 
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -412,11 +381,11 @@ export default function Preprocessing({ datasetId, onCompleted }) {
           </Section>
           )}
 
-          {/* ═══════ Section 5 : Séquençage temporel ═══════ */}
+          {/* ═══════ Section 4 : Séquençage temporel ═══════ */}
           {isReady('sequence') && (
           <Section
             icon={Boxes} color="var(--accent-blue)"
-            title="🧱 Étape 5 — Séquençage temporel"
+            title="🧱 Étape 4 — Séquençage temporel"
             description={`On glisse une fenêtre de ${lookback} jours sur la timeline de chaque composant. À chaque position : X = ${lookback} jours d'historique, y = RUL du jour suivant.`}>
 
             <SequenceVisualizer
@@ -428,21 +397,28 @@ export default function Preprocessing({ datasetId, onCompleted }) {
               sequenceMeta={preprocResult.sequence_meta}
             />
 
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
-              <ShapeBadge label="X_train (num)"  shape={preprocResult.X_train_num_shape}  color="var(--accent-blue)" />
-              <ShapeBadge label="X_train (comp)" shape={preprocResult.X_train_comp_shape} color="var(--accent-purple)" />
-              <ShapeBadge label="y_train"        shape={preprocResult.y_train_shape}      color="var(--accent-orange)" />
-              <ShapeBadge label="num_classes_comp" shape={[preprocResult.num_classes_comp]} color="var(--accent-pink)" />
+            <div className="grid grid-cols-3 gap-3 mt-4">
+              <ShapeBadge label="X_train" shape={preprocResult.X_train_num_shape} color="var(--accent-blue)" />
+              <ShapeBadge label="X_val"   shape={preprocResult.X_val_num_shape}   color="var(--accent-purple)" />
+              <ShapeBadge label="X_test"  shape={preprocResult.X_test_num_shape}  color="var(--accent-green)" />
+            </div>
+            <div className="grid grid-cols-3 gap-3 mt-2">
+              <ShapeBadge label="y_train" shape={preprocResult.y_train_shape} color="var(--accent-blue)" />
+              <ShapeBadge label="y_val"   shape={preprocResult.y_val_shape}   color="var(--accent-purple)" />
+              <ShapeBadge label="y_test"  shape={preprocResult.y_test_shape}  color="var(--accent-green)" />
+            </div>
+            <div className="mt-2">
+              <ShapeBadge label="Embedding (n_composants)" shape={[preprocResult.num_classes_comp]} color="var(--accent-orange)" />
             </div>
           </Section>
           )}
 
-          {/* ═══════ Section 6 : Poids d'entraînement ═══════ */}
+          {/* ═══════ Section 5 : Poids d'entraînement ═══════ */}
           {isReady('weights') && (
           <Section
             icon={Weight} color="var(--accent-orange)"
-            title="⚖️ Étape 6 — Poids d'entraînement"
-            description={`Formule du notebook : w = 1 + (1 − y_norm) × ${weightFactor}. Plage : [1, ${1 + Number(weightFactor)}]. Effet : les séquences avec RUL faible (donc y_norm bas) pèsent plus dans la loss → modèle prudent face aux pannes imminentes.`}>
+            title="⚖️ Étape 5 — Poids d'entraînement"
+            description={`Formule notebook PFE : w = 1 + ${weightFactor}×(1−RUL/${currentMaxRul}). Plage : [1, ${1 + Number(weightFactor)}]. RUL=0 (panne) → poids max. RUL=max (sain) → poids 1. Loss asymétrique : sous-estimation ×4 plus pénalisée.`}>
 
             {preprocResult.weight_stats && (
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
@@ -509,12 +485,11 @@ export default function Preprocessing({ datasetId, onCompleted }) {
                     qu'une séquence sans danger (poids = 1).
                   </p>
                   <p>
-                    <b>Pourquoi entre 13.5 et 16 ?</b> Avec la formule continue
-                    <code> w = 1 + (1 − y_norm) × {Number(weightFactor)}</code> et un
-                    max_rul = {currentMaxRul} :
-                    <br/>· RUL = 0j → y_norm = 0 → w = {(1 + Number(weightFactor)).toFixed(1)} (max)
-                    <br/>· RUL = 5j → y_norm = {(5 / Number(currentMaxRul)).toFixed(3)} → w ≈ {(1 + (1 - 5/Number(currentMaxRul)) * Number(weightFactor)).toFixed(1)}
-                    <br/>· RUL = {currentMaxRul}j → y_norm = 1 → w = 1 (composant sain)
+                    <b>Formule notebook PFE :</b>
+                    <code> w = 1 + {Number(weightFactor)} × (1 − RUL / {currentMaxRul})</code>
+                    <br/>· RUL = 0j → w = {(1 + Number(weightFactor)).toFixed(1)} (panne imminente — max)
+                    <br/>· RUL = 5j → w ≈ {(1 + (1 - 5/Number(currentMaxRul)) * Number(weightFactor)).toFixed(1)}
+                    <br/>· RUL = {currentMaxRul}j → w = 1 (composant sain — poids minimal)
                   </p>
                 </div>
 
@@ -671,21 +646,23 @@ function BalanceCard({ label, value, detail, color }) {
 }
 
 
-function SplitVisualBar({ label, pct, count, color }) {
+function SplitVisualBar({ label, pct, count, color, dateEnd }) {
   return (
     <div className="rounded-lg border p-3"
-      style={{ background: 'var(--bg-card)', borderColor: 'var(--border-default)' }}>
+      style={{ background: 'var(--bg-card)', borderColor: color }}>
       <div className="flex justify-between text-xs mb-1.5">
-        <span style={{ color: 'var(--text-tertiary)' }}>{label}</span>
-        <span className="font-mono font-bold" style={{ color }}>
-          {pct}% · {count || '?'} comp.
-        </span>
+        <span className="font-semibold" style={{ color }}>{label}</span>
+        <span className="font-mono font-bold" style={{ color }}>{pct}%</span>
       </div>
-      <div className="w-full h-3 rounded-full overflow-hidden"
+      <div className="w-full h-2.5 rounded-full overflow-hidden mb-1.5"
            style={{ background: 'var(--bg-card-alt)' }}>
         <div className="h-full rounded-full transition-all"
              style={{ background: color, width: `${pct}%` }}/>
       </div>
+      <p className="text-[10px] font-mono" style={{ color: 'var(--text-muted)' }}>
+        {count != null ? `${Number(count).toLocaleString()} lignes` : '—'}
+        {dateEnd && <span className="ml-1">· jusqu'au {String(dateEnd).slice(0, 10)}</span>}
+      </p>
     </div>
   );
 }

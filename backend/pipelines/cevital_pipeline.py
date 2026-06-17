@@ -58,6 +58,7 @@ class CevitalPipeline:
         "pannes_7j", "pannes_30j", "pannes_90j",
         "maint_7j",  "maint_30j",  "maint_90j",
         "DSLF",      "DSLM",
+        "month_sin", "month_cos",
     ]
 
     TARGET_COL  = "RUL"
@@ -71,6 +72,7 @@ class CevitalPipeline:
         "pannes_7j", "pannes_30j", "pannes_90j",
         "maint_7j", "maint_30j", "maint_90j",
         "DSLF", "DSLM", "MTBF_rolling", "has_mtbf",
+        "jours_depuis_panne",
         "month_sin", "month_cos", "dslf_mtbf_ratio",
         "RUL",
     ]
@@ -92,14 +94,18 @@ class CevitalPipeline:
         self.df_export:  Optional[pd.DataFrame] = None  # Dataset_V1 exporté
 
         # ─── Tenseurs LSTM/GRU (après prepare_sequences) ────────
-        self.X_train_num: Optional[np.ndarray] = None  # (n, lookback, n_features)
-        self.X_train_comp: Optional[np.ndarray] = None # (n,) indices composant
-        self.X_test_num:  Optional[np.ndarray] = None
-        self.X_test_comp: Optional[np.ndarray] = None
-        self.y_train:     Optional[np.ndarray] = None
-        self.y_test:      Optional[np.ndarray] = None
-        self.w_train:     Optional[np.ndarray] = None  # sample_weights
-        self.w_test:      Optional[np.ndarray] = None
+        self.X_train_num:  Optional[np.ndarray] = None  # (n, lookback, n_features)
+        self.X_train_comp: Optional[np.ndarray] = None  # (n,) indices composant
+        self.X_val_num:    Optional[np.ndarray] = None
+        self.X_val_comp:   Optional[np.ndarray] = None
+        self.X_test_num:   Optional[np.ndarray] = None
+        self.X_test_comp:  Optional[np.ndarray] = None
+        self.y_train:      Optional[np.ndarray] = None
+        self.y_val:        Optional[np.ndarray] = None
+        self.y_test:       Optional[np.ndarray] = None
+        self.w_train:      Optional[np.ndarray] = None  # sample_weights
+        self.w_val:        Optional[np.ndarray] = None
+        self.w_test:       Optional[np.ndarray] = None
 
         # ─── Scalers et métadonnées ─────────────────────────────
         self.scaler_x: Optional[MinMaxScaler] = None
@@ -217,9 +223,10 @@ class CevitalPipeline:
         if self.df_fail is None:
             raise RuntimeError("Charge d'abord les données avec load_raw_data()")
 
-        df = self.df_fail
-        df23 = df[df["annee"] >= self.year].copy()
-        df34 = df23[df23["WOWO_EQUIPMENT_LEVEL"].isin([3.0, 4.0])].copy()
+        df    = self.df_fail
+        df23  = df[df["annee"] == self.year].copy()   # exactement 2023
+        df_all_years = df[df["annee"] >= self.year].copy()  # 2023 + ajouts futurs
+        df34  = df_all_years[df_all_years["WOWO_EQUIPMENT_LEVEL"].isin([3.0, 4.0])].copy()
 
         # Labels métier des colonnes (notebook cell 6)
         COLS_UTILES_LABELS = {
@@ -244,7 +251,7 @@ class CevitalPipeline:
         missing_pct = (df[existing_cols].isnull().mean() * 100).round(1).to_dict()
 
         # ── Section 2 : Distribution par niveau hiérarchique ───
-        niveau_dist = df23["WOWO_EQUIPMENT_LEVEL"].value_counts().sort_index().to_dict()
+        niveau_dist = df_all_years["WOWO_EQUIPMENT_LEVEL"].value_counts().sort_index().to_dict()
         niveau_dist = {str(k): int(v) for k, v in niveau_dist.items()}
 
         # ── Section 3 : Distribution temporelle ─────────────────
@@ -252,8 +259,8 @@ class CevitalPipeline:
         pannes_mensuel = [int(v) for v in pannes_par_mois.values]
 
         # Niveaux séparés
-        nv3_mois = df23[df23["WOWO_EQUIPMENT_LEVEL"] == 3.0].groupby("mois").size().reindex(range(1, 13), fill_value=0)
-        nv4_mois = df23[df23["WOWO_EQUIPMENT_LEVEL"] == 4.0].groupby("mois").size().reindex(range(1, 13), fill_value=0)
+        nv3_mois = df_all_years[df_all_years["WOWO_EQUIPMENT_LEVEL"] == 3.0].groupby("mois").size().reindex(range(1, 13), fill_value=0)
+        nv4_mois = df_all_years[df_all_years["WOWO_EQUIPMENT_LEVEL"] == 4.0].groupby("mois").size().reindex(range(1, 13), fill_value=0)
 
         # Pannes cumulées
         df34_sorted = df34.sort_values("WOWO_DECLARATION_DATE")
@@ -301,9 +308,9 @@ class CevitalPipeline:
             }
 
         # ── Section 2.a : Pie répartition niveaux TOUT équipement (year filter) ──
-        niveau_dist_all = df23["WOWO_EQUIPMENT_LEVEL"].value_counts().sort_index().to_dict()
+        niveau_dist_all = df_all_years["WOWO_EQUIPMENT_LEVEL"].value_counts().sort_index().to_dict()
         niveau_dist_all = {str(k): int(v) for k, v in niveau_dist_all.items() if pd.notna(k)}
-        niveau_na = int(df23["WOWO_EQUIPMENT_LEVEL"].isna().sum())
+        niveau_na = int(df_all_years["WOWO_EQUIPMENT_LEVEL"].isna().sum())
 
         # ── Section 3.d : Pannes par jour de semaine (niveaux 3+4) ────
         if not df34.empty:
@@ -504,7 +511,7 @@ class CevitalPipeline:
         })
 
         # ───────────── ÉTAPE 3 : Hiérarchie machineID ───────────────
-        eq_dict = df_equip.set_index("EREQ_CODE")[
+        eq_dict = df_equip.drop_duplicates(subset=["EREQ_CODE"]).set_index("EREQ_CODE")[
             ["EREQ_LEVEL", "EREQ_PARENT_EQUIPMENT", "EREQ_DESCRIPTION"]
         ].to_dict("index")
 
@@ -752,12 +759,29 @@ class CevitalPipeline:
             df_comp["has_mtbf"] = df_comp["MTBF_rolling"].notna().astype(int)
             df_comp["MTBF_rolling"] = df_comp["MTBF_rolling"].fillna(0)
 
-            # 5. Saisonnalité (encodage cyclique du mois)
+            # 5. jours_depuis_panne — composant en attente de maintenance
+            failure_dates_arr = df_comp[df_comp["failure"] == 1]["date"].values
+            maint_dates_arr   = df_comp[df_comp["maintenance"] == 1]["date"].values
+            jours_depuis_panne = []
+            for _, row in df_comp.iterrows():
+                d = row["date"]
+                past_fails  = failure_dates_arr[failure_dates_arr <= d]
+                past_maints = maint_dates_arr[maint_dates_arr <= d]
+                if len(past_fails) > 0:
+                    last_f = past_fails[-1]
+                    last_m = past_maints[-1] if len(past_maints) > 0 else None
+                    if last_m is None or last_f > last_m:
+                        jours_depuis_panne.append(int((pd.Timestamp(d) - pd.Timestamp(last_f)).days))
+                        continue
+                jours_depuis_panne.append(0)
+            df_comp["jours_depuis_panne"] = jours_depuis_panne
+
+            # 6. Saisonnalité (encodage cyclique du mois)
             df_comp["month"] = df_comp["date"].dt.month
             df_comp["month_sin"] = np.sin(2 * np.pi * df_comp["month"] / 12)
             df_comp["month_cos"] = np.cos(2 * np.pi * df_comp["month"] / 12)
 
-            # 6. Ratio DSLF / MTBF (feature dérivée)
+            # 7. Ratio DSLF / MTBF (feature dérivée)
             df_comp["dslf_mtbf_ratio"] = df_comp["DSLF"] / (df_comp["MTBF_rolling"] + 1)
 
             return df_comp
@@ -781,7 +805,8 @@ class CevitalPipeline:
             "n_rows":         int(len(df_final)),
             "feature_cols":   list(self.FEATURE_COLS),
             "rolling_windows": [7, 30, 90],
-            "extra_features": ["DSLF", "DSLM", "MTBF_rolling",
+            "extra_features": ["DSLF", "DSLM", "MTBF_rolling", "has_mtbf",
+                                "jours_depuis_panne",
                                 "month_sin", "month_cos", "dslf_mtbf_ratio"],
         })
 
@@ -882,6 +907,7 @@ class CevitalPipeline:
 
         # Stats numériques
         num_cols = ["DSLF", "DSLM", "MTBF_rolling", "has_mtbf",
+                    "jours_depuis_panne",
                     "month_sin", "month_cos", "dslf_mtbf_ratio", "RUL"]
         stats = df[num_cols].describe().T.round(3).to_dict(orient="index")
         # Sérialiser les Timestamp
@@ -904,6 +930,7 @@ class CevitalPipeline:
                              "pannes_7j", "pannes_30j", "pannes_90j",
                              "maint_7j", "maint_30j", "maint_90j",
                              "DSLF", "DSLM", "MTBF_rolling", "has_mtbf",
+                             "jours_depuis_panne",
                              "month_sin", "month_cos", "dslf_mtbf_ratio"]
         # Garder uniquement les colonnes présentes dans df_export
         feature_cols_full = [c for c in feature_cols_full if c in df.columns]
@@ -965,190 +992,180 @@ class CevitalPipeline:
         }
 
     # ═══════════════════════════════════════════════════════════════
-    # PHASE 4 — PRÉTRAITEMENT LSTM/GRU (avec current_max_rul DYNAMIQUE)
+    # PHASE 4 — PRÉTRAITEMENT LSTM/GRU — méthodologie notebook PFE exact
     # ═══════════════════════════════════════════════════════════════
     def prepare_sequences(
         self,
-        lookback:        int   = 30,
+        lookback:        int   = 21,
         current_max_rul: int   = 30,
-        test_ratio:      float = 0.20,
-        weight_factor:   float = 15.0,
-        healthy_sample_frac: float = 0.30,
+        val_ratio:       float = 0.15,
+        test_ratio:      float = 0.15,
+        weight_factor:   float = 4.0,
         progress_callback=None,
     ) -> Dict:
         """
-        Phase 4 : Prétraitement LSTM/GRU complet (cellules 47-53).
+        Phase 4 : Prétraitement LSTM/GRU — méthodologie notebook PFE exact.
 
         Args:
-            lookback        : taille de la fenêtre temporelle (configurable UI)
-            current_max_rul : plafond du RUL — pilotable depuis l'UI (NOUVEAU)
-            test_ratio      : proportion test (0.20 par défaut)
-            weight_factor   : amplification du poids sur les RUL faibles (×15 par défaut)
-            healthy_sample_frac : proportion d'échantillons sains gardés (0.30 par défaut)
-            progress_callback : fonction(step_id, step_label, data) appelée après
-                chaque étape. Permet à l'UI de rendre progressivement.
-                step_id ∈ {"config", "balance", "split", "normalize", "sequence", "weights"}.
+            lookback        : fenêtre temporelle (défaut 21j = meilleure MAE notebook)
+            current_max_rul : plafond RUL — pilotable UI
+            val_ratio       : proportion validation — split par plage de DATES (défaut 0.15)
+            test_ratio      : proportion test — split par plage de DATES (défaut 0.15)
+            weight_factor   : facteur dans w = 1 + factor×(1−RUL/MAX_RUL) (défaut 4)
+            progress_callback : step_id ∈ {"config","split","normalize","sequence","weights"}
         """
+        from sklearn.preprocessing import LabelEncoder
+
         def _emit(step_id, step_label, data):
             if progress_callback is not None:
                 try:
                     progress_callback(step_id, step_label, data)
                 except Exception:
-                    # On ne casse JAMAIS le pipeline pour un souci d'UI
                     pass
 
         if self.df_export is None:
             raise RuntimeError("Lance compute_features() d'abord")
 
         df = self.df_export.copy()
-        df = df.sort_values(["failure_comp", "date"]).reset_index(drop=True)
+        df = df.sort_values([self.COMP_COL, "date"]).reset_index(drop=True)
 
-        # ── Application de current_max_rul (NOUVEAU — pilotable UI) ──
+        # ── Troncature RUL ────────────────────────────────────────────
         self.current_max_rul = current_max_rul
-        self.lookback = lookback
-        df["RUL"] = df["RUL"].apply(lambda x: min(x, current_max_rul))
+        self.lookback        = lookback
+        df["RUL"] = np.clip(df["RUL"], 0, current_max_rul)
+
+        # ── Sample weight — formule notebook : w = 1 + factor×(1−RUL/MAX_RUL) ──
+        df["sample_weight"] = 1.0 + weight_factor * (1.0 - df["RUL"] / current_max_rul)
+
+        # ── Encoding composant AVANT split (cohérence des indices) ───
+        le = LabelEncoder()
+        df["comp_idx"] = le.fit_transform(df[self.COMP_COL].astype(str))
+        self.num_classes_comp   = int(df["comp_idx"].nunique())
+        self._comp_name_to_idx  = {str(c): int(i) for i, c in enumerate(le.classes_)}
 
         _emit("config", "Configuration appliquée", {
             "lookback":        int(lookback),
             "current_max_rul": int(current_max_rul),
             "weight_factor":   float(weight_factor),
+            "val_ratio":       float(val_ratio),
             "test_ratio":      float(test_ratio),
-            "healthy_sample_frac": float(healthy_sample_frac),
             "n_rows_initial":  int(len(df)),
+            "n_composants":    int(self.num_classes_comp),
             "features":        list(self.FEATURE_COLS),
             "target":          self.TARGET_COL,
         })
 
-        # ── Équilibrage sain/dégradé ────────────────────────────────
-        mask_sain = df["RUL"] >= current_max_rul
-        n_sain_avant = int(mask_sain.sum())
-        n_degrad     = int((~mask_sain).sum())
-        df_degrad = df[~mask_sain]
-        df_sain_reduit = df[mask_sain].sample(frac=healthy_sample_frac, random_state=self.random_state)
-        df = pd.concat([df_degrad, df_sain_reduit]).sort_values(["failure_comp", "date"]).reset_index(drop=True)
+        # ── Split TEMPOREL par plage de dates (notebook exact) ────────
+        d_min       = df["date"].min()
+        n_days      = (df["date"].max() - d_min).days
+        train_ratio = 1.0 - val_ratio - test_ratio
+        split_train = d_min + pd.Timedelta(days=int(n_days * train_ratio))
+        split_val   = d_min + pd.Timedelta(days=int(n_days * (train_ratio + val_ratio)))
 
-        # Indexation composants (pour embedding)
-        df["comp_idx"] = df["failure_comp"].astype("category").cat.codes
-        self.num_classes_comp = int(df["comp_idx"].nunique())
+        df_train = df[df["date"] <  split_train].copy().reset_index(drop=True)
+        df_val   = df[(df["date"] >= split_train) & (df["date"] < split_val)].copy().reset_index(drop=True)
+        df_test  = df[df["date"] >= split_val].copy().reset_index(drop=True)
 
-        # ── 🆕 Phase 5 : tracker nom_composant → idx_embedding ─────
-        # Sauvegardé tel quel dans `comp_mapping.json` lors de l'export ZIP,
-        # pour permettre une réutilisation du modèle hors plateforme.
-        # Logique métier inchangée — c'est juste un attribut auxiliaire.
-        self._comp_name_to_idx = {
-            str(name): int(idx)
-            for name, idx in zip(df[self.COMP_COL].astype(str), df["comp_idx"].astype(int))
-        }
-
-        _emit("balance", "Équilibrage sain/dégradé", {
-            "n_sain_avant":         n_sain_avant,
-            "n_degrad":             n_degrad,
-            "n_sain_apres":         int(len(df_sain_reduit)),
-            "n_rows_after_balance": int(len(df)),
-            "num_classes_comp":     int(self.num_classes_comp),
-            "healthy_sample_frac":  float(healthy_sample_frac),
+        _emit("split", "Split temporel par date", {
+            "n_train_rows":   int(len(df_train)),
+            "n_val_rows":     int(len(df_val)),
+            "n_test_rows":    int(len(df_test)),
+            "train_ratio":    round(train_ratio, 2),
+            "val_ratio":      float(val_ratio),
+            "test_ratio":     float(test_ratio),
+            "train_date_end": str(df_train["date"].max()) if len(df_train) > 0 else None,
+            "val_date_end":   str(df_val["date"].max())   if len(df_val)   > 0 else None,
+            "test_date_end":  str(df_test["date"].max())  if len(df_test)  > 0 else None,
         })
 
-        # ── Split par composant ─────────────────────────────────────
-        all_components = df[self.COMP_COL].unique()
-        np.random.seed(self.random_state)
-        np.random.shuffle(all_components)
-        train_size = int(len(all_components) * (1 - test_ratio))
-        train_comps, test_comps = all_components[:train_size], all_components[train_size:]
-
-        df_train = df[df[self.COMP_COL].isin(train_comps)].reset_index(drop=True)
-        df_test  = df[df[self.COMP_COL].isin(test_comps)].reset_index(drop=True)
-
-        _emit("split", "Split par composant", {
-            "n_train_comps":              int(len(train_comps)),
-            "n_test_comps":               int(len(test_comps)),
-            "n_train_rows_after_balance": int(len(df_train)),
-            "n_test_rows_after_balance":  int(len(df_test)),
-            "test_ratio":                 float(test_ratio),
-        })
-
-        # ── Normalisation (MinMaxScaler) ────────────────────────────
+        # ── Normalisation MinMax (fit sur TRAIN uniquement — pas de leak) ──
         self.scaler_x = MinMaxScaler()
         self.scaler_y = MinMaxScaler()
         X_train_s = self.scaler_x.fit_transform(df_train[self.FEATURE_COLS])
-        X_test_s  = self.scaler_x.transform(df_test[self.FEATURE_COLS])
+        X_val_s   = self.scaler_x.transform(df_val[self.FEATURE_COLS])   if len(df_val)  > 0 else np.empty((0, len(self.FEATURE_COLS)))
+        X_test_s  = self.scaler_x.transform(df_test[self.FEATURE_COLS])  if len(df_test) > 0 else np.empty((0, len(self.FEATURE_COLS)))
         y_train_s = self.scaler_y.fit_transform(df_train[[self.TARGET_COL]])
-        y_test_s  = self.scaler_y.transform(df_test[[self.TARGET_COL]])
+        y_val_s   = self.scaler_y.transform(df_val[[self.TARGET_COL]])   if len(df_val)  > 0 else np.empty((0, 1))
+        y_test_s  = self.scaler_y.transform(df_test[[self.TARGET_COL]])  if len(df_test) > 0 else np.empty((0, 1))
 
-        # Aperçus raw + normalisé pour Section 4
-        preview_X_raw_n = []
-        preview_y_raw_n = []
-        preview_X_norm  = []
-        if not df_train.empty:
-            preview_X_raw_n = df_train[self.FEATURE_COLS].head(5).round(3).to_dict("records")
-            preview_y_raw_n = df_train[self.TARGET_COL].head(5).astype(int).tolist()
-            preview_X_norm  = X_train_s[:5].round(4).tolist()
+        preview_X_raw_n = df_train[self.FEATURE_COLS].head(5).round(3).to_dict("records") if not df_train.empty else []
+        preview_y_raw_n = df_train[self.TARGET_COL].head(5).astype(int).tolist()           if not df_train.empty else []
+        preview_X_norm  = X_train_s[:5].round(4).tolist()                                  if len(X_train_s) > 0 else []
 
         _emit("normalize", "Normalisation MinMax", {
-            "features":              list(self.FEATURE_COLS),
-            "preview_X_raw":         preview_X_raw_n,
-            "preview_y_raw":         preview_y_raw_n,
-            "preview_normalized_X":  preview_X_norm,
+            "features":             list(self.FEATURE_COLS),
+            "preview_X_raw":        preview_X_raw_n,
+            "preview_y_raw":        preview_y_raw_n,
+            "preview_normalized_X": preview_X_norm,
         })
 
-        # ── Séquençage avec poids renforcés ─────────────────────────
-        def create_sequences_weighted(X_s, y_s, df_meta, lb, wf):
-            X_num, X_comp, ys, weights = [], [], [], []
+        # ── Séquençage — X_cat shape (N, LOOKBACK) = notebook exact ──
+        def create_sequences(X_s, y_s, df_meta):
+            X_num, X_cat, y_seq, sw_seq = [], [], [], []
             for comp in df_meta[self.COMP_COL].unique():
-                mask = df_meta[self.COMP_COL].values == comp
-                X_c, y_c = X_s[mask], y_s[mask]
-                if mask.sum() <= lb:
+                mask   = df_meta[self.COMP_COL].values == comp
+                X_c    = X_s[mask]
+                y_c    = y_s[mask]
+                sw_c   = df_meta["sample_weight"].values[mask]
+                cidx_c = df_meta["comp_idx"].values[mask]
+                n      = int(mask.sum())
+                if n <= lookback:
                     continue
-                c_idx = df_meta.loc[mask, "comp_idx"].values[0]
-                for i in range(len(X_c) - lb):
-                    X_num.append(X_c[i:i+lb])
-                    X_comp.append(c_idx)
-                    val_y = y_c[i+lb][0]
-                    ys.append(val_y)
-                    # Poids = 1 + (1 - y_normalisé) × weight_factor
-                    weights.append(1.0 + (1.0 - val_y) * wf)
-            return np.array(X_num), np.array(X_comp), np.array(ys), np.array(weights)
+                for i in range(n - lookback):
+                    X_num.append(X_c[i : i + lookback])
+                    X_cat.append(cidx_c[i : i + lookback])  # (lookback,) — notebook
+                    y_seq.append(y_c[i + lookback][0])
+                    sw_seq.append(sw_c[i + lookback])
+            if not X_num:
+                n_f = len(self.FEATURE_COLS)
+                return (np.empty((0, lookback, n_f), dtype=np.float32),
+                        np.empty((0, lookback),      dtype=np.int32),
+                        np.empty((0,),               dtype=np.float32),
+                        np.empty((0,),               dtype=np.float32))
+            return (np.array(X_num,  dtype=np.float32),
+                    np.array(X_cat,  dtype=np.int32),
+                    np.array(y_seq,  dtype=np.float32),
+                    np.array(sw_seq, dtype=np.float32))
 
-        Xn_tr, Xc_tr, ytr, wtr = create_sequences_weighted(X_train_s, y_train_s, df_train, lookback, weight_factor)
-        Xn_te, Xc_te, yte, wte = create_sequences_weighted(X_test_s,  y_test_s,  df_test,  lookback, weight_factor)
+        Xn_tr, Xc_tr, ytr, wtr = create_sequences(X_train_s, y_train_s, df_train)
+        Xn_va, Xc_va, yva, wva = create_sequences(X_val_s,   y_val_s,   df_val)
+        Xn_te, Xc_te, yte, wte = create_sequences(X_test_s,  y_test_s,  df_test)
 
-        # ── Sauvegarde des tenseurs ─────────────────────────────────
         self.X_train_num,  self.X_train_comp = Xn_tr, Xc_tr
+        self.X_val_num,    self.X_val_comp   = Xn_va, Xc_va
         self.X_test_num,   self.X_test_comp  = Xn_te, Xc_te
-        self.y_train, self.y_test = ytr, yte
-        self.w_train, self.w_test = wtr, wte
-        # Garder les df de test pour pouvoir construire le tableau des dates de pannes
+        self.y_train, self.y_val,  self.y_test = ytr, yva, yte
+        self.w_train, self.w_val,  self.w_test = wtr, wva, wte
         self._df_test = df_test
         self.is_ready = True
-
         self.phases_completed.append("prepare_sequences")
 
-        # 🆕 Séquence COMPLÈTE (lookback rows) — pour la viz "tableau par t"
+        # Séquence complète pour viz "tableau par t"
         sequence_full_raw_s  = []
         sequence_full_norm_s = []
         sequence_meta_s      = {}
-        if len(df_train) >= lookback and self.scaler_x is not None:
-            seq_raw_df = df_train[self.FEATURE_COLS].iloc[:lookback].copy()
-            sequence_full_raw_s = seq_raw_df.round(3).to_dict("records")
+        if len(df_train) >= lookback:
+            sequence_full_raw_s  = df_train[self.FEATURE_COLS].iloc[:lookback].round(3).to_dict("records")
             sequence_full_norm_s = X_train_s[:lookback].round(4).tolist()
-            comp_first = str(df_train[self.COMP_COL].iloc[0])
             sequence_meta_s = {
-                "comp":          comp_first,
-                "lookback":      int(lookback),
-                "n_features":    len(self.FEATURE_COLS),
-                "date_start":    str(df_train["date"].iloc[0])            if "date" in df_train.columns else None,
-                "date_end":      str(df_train["date"].iloc[lookback - 1]) if "date" in df_train.columns and len(df_train) > lookback - 1 else None,
-                "date_target":   str(df_train["date"].iloc[lookback])     if "date" in df_train.columns and len(df_train) > lookback else None,
-                "y_target_raw":  int(df_train[self.TARGET_COL].iloc[lookback]) if len(df_train) > lookback else None,
-                "y_target_norm": float(y_train_s[lookback][0])            if len(y_train_s) > lookback else None,
+                "comp":         str(df_train[self.COMP_COL].iloc[0]),
+                "lookback":     int(lookback),
+                "n_features":   len(self.FEATURE_COLS),
+                "date_start":   str(df_train["date"].iloc[0])            if "date" in df_train.columns else None,
+                "date_end":     str(df_train["date"].iloc[lookback - 1]) if len(df_train) > lookback - 1 else None,
+                "date_target":  str(df_train["date"].iloc[lookback])     if len(df_train) > lookback else None,
+                "y_target_raw": int(df_train[self.TARGET_COL].iloc[lookback]) if len(df_train) > lookback else None,
+                "y_target_norm": float(y_train_s[lookback][0])           if len(y_train_s) > lookback else None,
             }
 
         _emit("sequence", "Séquençage temporel", {
             "X_train_num_shape":  list(Xn_tr.shape),
             "X_train_comp_shape": list(Xc_tr.shape),
+            "X_val_num_shape":    list(Xn_va.shape),
             "X_test_num_shape":   list(Xn_te.shape),
             "X_test_comp_shape":  list(Xc_te.shape),
             "y_train_shape":      list(ytr.shape),
+            "y_val_shape":        list(yva.shape),
             "y_test_shape":       list(yte.shape),
             "num_classes_comp":   int(self.num_classes_comp),
             "lookback":           int(lookback),
@@ -1158,115 +1175,74 @@ class CevitalPipeline:
             "sequence_meta":      sequence_meta_s,
         })
 
-        # ── Diagnostics (formule inchangée — read-only) ──────────────
-        if len(ytr) > 0 and self.scaler_y is not None:
-            raw_rul_train = self.scaler_y.inverse_transform(
-                ytr.reshape(-1, 1)
-            ).flatten()
-            n_weights_15 = int(np.isclose(wtr, 15.0, atol=1e-6).sum())
-            n_weights_1  = int(np.isclose(wtr, 1.0,  atol=1e-6).sum())
-            mask_crit    = raw_rul_train <= 5.0
+        # ── Diagnostics poids ────────────────────────────────────────
+        if len(wtr) > 0:
+            n_weights_max = int(np.isclose(wtr, 1.0 + weight_factor, atol=0.1).sum())
+            n_weights_1   = int(np.isclose(wtr, 1.0, atol=0.1).sum())
+            mask_crit     = self.scaler_y.inverse_transform(ytr.reshape(-1,1)).flatten() <= 5.0
             preview_weights_critical = wtr[mask_crit][:10].tolist() if mask_crit.any() else []
-
-            # 🆕 Stats globales pour visualisation jury
             weight_stats = {
-                "min":    float(wtr.min()),
-                "max":    float(wtr.max()),
-                "mean":   float(wtr.mean()),
-                "std":    float(wtr.std()),
-                "n_total": int(len(wtr)),
-                "n_above_2":  int((wtr > 2.0).sum()),
-                "n_above_8":  int((wtr > 8.0).sum()),
-                "n_above_14": int((wtr > 14.0).sum()),
+                "min":       float(wtr.min()),
+                "max":       float(wtr.max()),
+                "mean":      float(wtr.mean()),
+                "std":       float(wtr.std()),
+                "n_total":   int(len(wtr)),
+                "n_above_2": int((wtr > 2.0).sum()),
+                "n_above_8": int((wtr > 8.0).sum()),
             }
-            # Histogramme des poids — 12 bins
-            hist_counts, hist_bins = np.histogram(
-                wtr, bins=12, range=(1.0, max(2.0, float(wtr.max())))
-            )
+            hist_counts, hist_bins = np.histogram(wtr, bins=12, range=(1.0, max(2.0, float(wtr.max()))))
             weight_histogram = {
                 "bins":   [round(float(b), 2) for b in hist_bins.tolist()],
                 "counts": [int(c) for c in hist_counts.tolist()],
             }
         else:
-            n_weights_15 = 0
-            n_weights_1  = 0
+            n_weights_max            = 0
+            n_weights_1              = 0
             preview_weights_critical = []
-            weight_stats = None
-            weight_histogram = None
-
-        # 🆕 Aperçu RAW (avant normalisation) — 5 premières lignes de df_train
-        preview_X_raw = []
-        preview_y_raw = []
-        if not df_train.empty:
-            preview_X_raw = (
-                df_train[self.FEATURE_COLS].head(5).round(3).to_dict("records")
-            )
-            preview_y_raw = df_train[self.TARGET_COL].head(5).astype(int).tolist()
-
-        # 🆕 Séquence COMPLÈTE (lookback rows) — pour la viz "tableau par t"
-        # On prend la première séquence du training set : rows 0..lookback-1
-        sequence_full_raw = []
-        sequence_full_norm = []
-        sequence_meta = {}
-        if len(df_train) >= lookback and self.scaler_x is not None:
-            seq_raw_df = df_train[self.FEATURE_COLS].iloc[:lookback].copy()
-            sequence_full_raw = seq_raw_df.round(3).to_dict("records")
-            sequence_full_norm = X_train_s[:lookback].round(4).tolist()
-            # méta : composant + date + RUL cible (la valeur juste après les lookback rows)
-            comp_first = str(df_train[self.COMP_COL].iloc[0])
-            sequence_meta = {
-                "comp":         comp_first,
-                "lookback":     int(lookback),
-                "n_features":   len(self.FEATURE_COLS),
-                "date_start":   str(df_train["date"].iloc[0])           if "date" in df_train.columns else None,
-                "date_end":     str(df_train["date"].iloc[lookback - 1]) if "date" in df_train.columns and len(df_train) > lookback - 1 else None,
-                "date_target":  str(df_train["date"].iloc[lookback])     if "date" in df_train.columns and len(df_train) > lookback else None,
-                "y_target_raw": int(df_train[self.TARGET_COL].iloc[lookback]) if len(df_train) > lookback else None,
-                "y_target_norm": float(y_train_s[lookback][0]) if len(y_train_s) > lookback else None,
-            }
+            weight_stats             = None
+            weight_histogram         = None
 
         _emit("weights", "Poids d'entraînement", {
             "weight_factor":            float(weight_factor),
             "weight_stats":             weight_stats,
             "weight_histogram":         weight_histogram,
             "preview_weights_critical": preview_weights_critical,
-            "n_weights_15":             n_weights_15,
+            "n_weights_max":            n_weights_max,
             "n_weights_1":              n_weights_1,
         })
 
         return {
-            "lookback":        int(lookback),
-            "current_max_rul": int(current_max_rul),
-            "weight_factor":   float(weight_factor),
-            "num_classes_comp": int(self.num_classes_comp),
-            "X_train_num_shape":  list(Xn_tr.shape),
-            "X_train_comp_shape": list(Xc_tr.shape),
-            "X_test_num_shape":   list(Xn_te.shape),
-            "X_test_comp_shape":  list(Xc_te.shape),
-            "y_train_shape":  list(ytr.shape),
-            "y_test_shape":   list(yte.shape),
-            "n_train_comps":  int(len(train_comps)),
-            "n_test_comps":   int(len(test_comps)),
-            "features":       self.FEATURE_COLS,
-            "target":         self.TARGET_COL,
-            # Aperçus pour visualisation UI
-            "preview_normalized_X": Xn_tr[0, :5, :].tolist() if len(Xn_tr) else [],
-            "preview_weights":      wtr[:10].tolist() if len(wtr) else [],
-            # ─── Diagnostics demandés ─────────────────────────────
-            "n_weights_15":           n_weights_15,
-            "n_weights_1":            n_weights_1,
+            "lookback":          int(lookback),
+            "current_max_rul":   int(current_max_rul),
+            "weight_factor":     float(weight_factor),
+            "val_ratio":         float(val_ratio),
+            "test_ratio":        float(test_ratio),
+            "num_classes_comp":  int(self.num_classes_comp),
+            "X_train_num_shape": list(Xn_tr.shape),
+            "X_train_comp_shape":list(Xc_tr.shape),
+            "X_val_num_shape":   list(Xn_va.shape),
+            "X_test_num_shape":  list(Xn_te.shape),
+            "X_test_comp_shape": list(Xc_te.shape),
+            "y_train_shape":     list(ytr.shape),
+            "y_val_shape":       list(yva.shape),
+            "y_test_shape":      list(yte.shape),
+            "n_train_rows":      int(len(df_train)),
+            "n_val_rows":        int(len(df_val)),
+            "n_test_rows":       int(len(df_test)),
+            "features":          self.FEATURE_COLS,
+            "target":            self.TARGET_COL,
+            "preview_normalized_X":     preview_X_norm,
+            "preview_weights":          wtr[:10].tolist() if len(wtr) else [],
+            "n_weights_max":            n_weights_max,
+            "n_weights_1":              n_weights_1,
             "preview_weights_critical": preview_weights_critical,
-            # 🆕 Analytics pour visualisation pédagogique jury
-            "weight_stats":     weight_stats,
-            "weight_histogram": weight_histogram,
-            "preview_X_raw":    preview_X_raw,
-            "preview_y_raw":    preview_y_raw,
-            "n_train_rows_after_balance": int(len(df_train)),
-            "n_test_rows_after_balance":  int(len(df_test)),
-            # 🆕 Séquence complète (toutes les valeurs t=0..lookback-1) pour la viz
-            "sequence_full_raw":  sequence_full_raw,    # list of dicts (lookback rows)
-            "sequence_full_norm": sequence_full_norm,   # 2D list (lookback × n_features)
-            "sequence_meta":      sequence_meta,
+            "weight_stats":             weight_stats,
+            "weight_histogram":         weight_histogram,
+            "preview_X_raw":            preview_X_raw_n,
+            "preview_y_raw":            preview_y_raw_n,
+            "sequence_full_raw":        sequence_full_raw_s,
+            "sequence_full_norm":       sequence_full_norm_s,
+            "sequence_meta":            sequence_meta_s,
         }
 
     # ═══════════════════════════════════════════════════════════════

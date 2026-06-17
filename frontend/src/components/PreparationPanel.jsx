@@ -18,7 +18,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import {
   BarChart3, Cog, TrendingUp, Layers, RefreshCw,
-  Upload, Database, CheckCircle2, Lock, ChevronRight,
+  Upload, Database, CheckCircle2, Lock, ChevronRight, RotateCcw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useApp } from '../AppContext';
@@ -45,7 +45,7 @@ const SUBTABS = [
 export default function PreparationPanel() {
   const {
     currentDatasetId, selectDataset,
-    prepStepCompleted, datasetVersion,
+    prepStepCompleted, datasetVersion, resetPipelineResults,
   } = useApp();
 
   const [activeSubtab, setActiveSubtab] = useState('raw_eda');
@@ -186,9 +186,25 @@ export default function PreparationPanel() {
           <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-tertiary)' }}>
             Progression du pipeline
           </p>
-          <p className="text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
-            {stepsValidated}/4 étape{stepsValidated > 1 ? 's' : ''} validée{stepsValidated > 1 ? 's' : ''}
-          </p>
+          <div className="flex items-center gap-3">
+            <p className="text-xs font-mono" style={{ color: 'var(--text-tertiary)' }}>
+              {stepsValidated}/4 étape{stepsValidated > 1 ? 's' : ''} validée{stepsValidated > 1 ? 's' : ''}
+            </p>
+            <button
+              onClick={() => { resetPipelineResults(); }}
+              title="Réinitialiser EDA, Features et Preprocessing"
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-semibold border transition-all"
+              style={{
+                background: 'transparent',
+                color: 'var(--accent-orange)',
+                borderColor: 'var(--accent-orange)',
+                cursor: 'pointer',
+              }}
+            >
+              <RotateCcw size={11} />
+              Réinitialiser
+            </button>
+          </div>
         </div>
 
         {/* Barre de progression */}

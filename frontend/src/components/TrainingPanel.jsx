@@ -276,7 +276,7 @@ function PredictionsView({ data, hyperparams }) {
   return (
     <div className="space-y-5">
       <InfoBox
-        text="Résultats sur le jeu de test (split par composant — données jamais vues pendant l'entraînement). Les valeurs sont dénormalisées et clippées dans [0, current_max_rul] via predict_with_safety()."
+        text="Résultats sur le jeu de test (split temporel par date — données jamais vues pendant l'entraînement ni la validation). Les valeurs sont dénormalisées et clippées dans [0, current_max_rul] via predict_with_safety()."
         color="var(--success)"
       />
 
@@ -448,6 +448,8 @@ export default function TrainingPanel() {
   } = useApp();
 
   const [mode,         setMode]         = useState('manual');
+  const [trainScope,   setTrainScope]   = useState('normal');  // 'normal' (split) | 'full' (déploiement, 100% data)
+  const [sourceExpId,  setSourceExpId]  = useState(null);      // expérience source → meilleure époque
   const [arch,         setArch]         = useState('LSTM');
   const [expName,      setExpName]      = useState('Exp_LSTM_01');
   const [embeddingDim, setEmbeddingDim] = useState(8);
@@ -468,10 +470,12 @@ export default function TrainingPanel() {
   // n'importe quel dataset preprocessed (dataset B fusionné, par exemple).
   useEffect(() => {
     if (!pendingRetrain) return;
-    const { hyperparams: hp, architecture, mode: m, name } = pendingRetrain;
+    const { hyperparams: hp, architecture, mode: m, name, source_experiment_id } = pendingRetrain;
     // ⚠️ dataset_id intentionnellement IGNORÉ — voir commentaire ci-dessus
     if (architecture) setArch(architecture);
-    if (m) setMode(m);
+    if (m === 'manual' || m === 'auto') setMode(m);   // 'full' n'est pas un mode du toggle
+    if (m === 'full') setTrainScope('full');           // réentraîner un modèle déployé → "toutes les données"
+    if (source_experiment_id != null) setSourceExpId(source_experiment_id);
     if (name) setExpName(name);
     if (hp) {
       if (hp.embedding_dim != null) setEmbeddingDim(hp.embedding_dim);
@@ -519,20 +523,20 @@ export default function TrainingPanel() {
   const [patience,  setPatience]  = useState(10);
 
   // AutoML
-  // AutoML — bornes manuelles (défauts = notebook PFE_CHAMPION cell 56)
+  // AutoML — bornes espace de recherche gp_minimize (défauts = notebook PFE exact)
   const [layersMin,  setLayersMin]  = useState(1);
-  const [layersMax,  setLayersMax]  = useState(2);
-  const [unitsMin,   setUnitsMin]   = useState(64);
+  const [layersMax,  setLayersMax]  = useState(1);     // notebook : 1 couche LSTM
+  const [unitsMin,   setUnitsMin]   = useState(32);    // notebook : Integer(32, 128)
   const [unitsMax,   setUnitsMax]   = useState(128);
-  const [unitsStep,  setUnitsStep]  = useState(32);
-  const [dropMin,    setDropMin]    = useState(0.10);
-  const [dropMax,    setDropMax]    = useState(0.25);
-  const [lrChoices,  setLrChoices]  = useState([1e-3, 2e-3]);
+  const [unitsStep,  setUnitsStep]  = useState(32);    // ignoré par gp_minimize
+  const [dropMin,    setDropMin]    = useState(0.10);  // notebook : Real(0.1, 0.4)
+  const [dropMax,    setDropMax]    = useState(0.40);
+  const [lrChoices,  setLrChoices]  = useState([1e-4, 1e-2]); // notebook : Real(1e-4, 1e-2, log-uniform)
   const [embSearch,  setEmbSearch]  = useState([4, 8, 16, 32]);
-  const [maxTrials,  setMaxTrials]  = useState(10);
-  const [trialEp,    setTrialEp]    = useState(12);    // notebook : 12
-  const [finalEp,    setFinalEp]    = useState(60);    // notebook : 60
-  const [cvFolds,    setCvFolds]    = useState(5);     // gardé pour compat, pas envoyé
+  const [maxTrials,  setMaxTrials]  = useState(20);   // notebook : N_CALLS=20
+  const [trialEp,    setTrialEp]    = useState(20);   // notebook : EPOCHS_CV=20
+  const [finalEp,    setFinalEp]    = useState(35);   // notebook : EPOCHS_FIN=35
+  const [cvFolds,    setCvFolds]    = useState(3);    // notebook : N_CV_FOLDS=3
 
   // État
   const [trainingStatus, setTrainingStatus] = useState('idle');
@@ -590,7 +594,7 @@ export default function TrainingPanel() {
             addLog(`  ✅ Essai ${data.trial} terminé — CV Loss: ${data.avg_cv_loss?.toFixed(5)}`);
             // Si c'était le dernier essai → on signale le re-train final dans les logs
             if (data.trial >= maxTrials) {
-              addLog(`\n🏗️ Phase 2 — Re-train final sur le best model (${finalEp} époques)…`);
+              addLog(`\n🏗️ Phase 2 — Entraînement final sur le best model (${finalEp} époques, EarlyStopping + ReduceLROnPlateau)…`);
             }
             break;
           case 'result':
@@ -627,12 +631,30 @@ export default function TrainingPanel() {
     resetState();
     setTrainingStatus('running');
     setStartTime(Date.now());
-    addLog(mode === 'auto'
-      ? `🚀 Lancement AutoML Bayésien (${maxTrials} essais × ${trialEp} époques + re-train ${finalEp})…`
+    addLog(trainScope === 'full'
+      ? `🚀 Réentraînement sur TOUTES les données (déploiement)…`
+      : mode === 'auto'
+      ? `🚀 Lancement AutoML Bayésien (${maxTrials} essais × CV 3 folds × ${trialEp} ep/fold — puis re-train ${finalEp} ep)…`
       : `🚀 Lancement entraînement Manuel (${epochs} époques)…`
     );
-    const url = mode==='manual' ? `${API}/api/train/manual` : `${API}/api/train/auto`;
-    const payload = mode==='manual'
+    const url = trainScope === 'full'
+      ? `${API}/api/train/full`
+      : mode==='manual' ? `${API}/api/train/manual` : `${API}/api/train/auto`;
+    const payload = trainScope === 'full'
+      ? {
+          dataset_id:    currentDatasetId,
+          name:          expName,
+          architecture:  arch,
+          embedding_dim: embeddingDim,
+          num_layers:    numLayers,
+          units:         units.slice(0, numLayers),
+          dropout_rates: dropouts.slice(0, numLayers),
+          learning_rate: lr,
+          batch_size:    batchSize,
+          epochs,
+          source_experiment_id: sourceExpId,
+        }
+      : mode==='manual'
       ? {
           dataset_id:    currentDatasetId,
           name:          expName,
@@ -674,7 +696,7 @@ export default function TrainingPanel() {
       addLog(`❌ ${e.message}`);
       setTrainingStatus('error');
     }
-  }, [currentDatasetId, datasetReady, mode, arch, expName, embeddingDim,
+  }, [currentDatasetId, datasetReady, mode, trainScope, sourceExpId, arch, expName, embeddingDim,
       numLayers, units, dropouts, lr, epochs, batchSize, patience,
       maxTrials, trialEp]);
 
@@ -715,7 +737,36 @@ export default function TrainingPanel() {
           onSelect={selectDataset}
         />
 
-        {/* Mode */}
+        {/* 🆕 Type d'entraînement : Normal (split) vs Toutes les données (déploiement) */}
+        <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
+          <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Type d'entraînement</p>
+          <div className="flex gap-2">
+            {[
+              ['normal', '🎯 Normal',             'Split train/val/test — pour évaluer le modèle'],
+              ['full',   '📦 Toutes les données', 'Réentraîne sur 100% des données — pour le déploiement'],
+            ].map(([s, label, hint]) => (
+              <button key={s}
+                onClick={() => { setTrainScope(s); setSourceExpId(null); if (s === 'full') setMode('manual'); }}
+                title={hint}
+                className="flex-1 py-2 rounded-lg text-sm font-semibold border transition-all"
+                style={{
+                  background:  trainScope===s ? 'var(--tint-warning-bg, var(--bg-elevated))' : 'var(--bg-elevated)',
+                  borderColor: trainScope===s ? 'var(--accent-amber, var(--accent-blue))'     : 'var(--border-default)',
+                  color:       trainScope===s ? 'var(--accent-amber, var(--accent-blue))'     : 'var(--text-muted)',
+                }}>
+                {label}
+              </button>
+            ))}
+          </div>
+          {trainScope === 'full' && (
+            <p className="text-xs mt-2" style={{ color:'var(--text-tertiary)' }}>
+              Hyperparamètres fixes (ceux du modèle). Époques = meilleure époque de l'entraînement normal. Pas d'AutoML ici.
+            </p>
+          )}
+        </div>
+
+        {/* Mode (seulement en entraînement normal) */}
+        {trainScope === 'normal' && (
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
           <p className={lblCls} style={{ color:'var(--text-tertiary)' }}>Mode</p>
           <div className="flex gap-2">
@@ -732,6 +783,7 @@ export default function TrainingPanel() {
             ))}
           </div>
         </div>
+        )}
 
         {/* Architecture — LSTM/GRU enabled, RNN/Transformer grisés */}
         <div className="rounded-xl border p-4" style={{ background:'var(--bg-card)', borderColor:'var(--border-default)' }}>
@@ -979,11 +1031,11 @@ export default function TrainingPanel() {
                   Mode AutoML — Recherche bayésienne
                 </p>
                 <p className="text-xs mt-1" style={{ color:'var(--text-tertiary)' }}>
-                  <b>Phase 1 — Recherche</b> : {maxTrials} essais × max {trialEp} époques chacun
-                  = <span style={{color:'var(--accent-green)'}}>jusqu'à {maxTrials * trialEp} époques</span> pour explorer<br/>
-                  <b>Phase 2 — Entraînement final</b> : best model ré-entraîné sur
-                  <span style={{color:'var(--accent-orange)'}}> {finalEp} époques</span> (notebook PFE = 60)<br/>
-                  Early stopping après <b>{patience}</b> époques sans amélioration ·
+                  <b>Phase 1 — Optimisation Bayésienne (GP)</b> : {maxTrials} essais × CV {cvFolds} folds × max {trialEp} ep/fold
+                  = <span style={{color:'var(--accent-green)'}}>jusqu'à {maxTrials * cvFolds * trialEp} époques</span> d'exploration<br/>
+                  <b>Phase 2 — Entraînement final</b> : best model entraîné sur
+                  <span style={{color:'var(--accent-orange)'}}> {finalEp} époques</span> (notebook PFE : EPOCHS_FIN=35)<br/>
+                  EarlyStopping patience=6 + ReduceLROnPlateau · patience CV : <b>{patience}</b> ·
                   Logs LIVE à chaque essai dans la zone monitoring.
                 </p>
               </div>
@@ -1002,7 +1054,7 @@ export default function TrainingPanel() {
           }}>
           {trainingStatus==='running'
             ? <><Loader size={16} className="animate-spin"/> Entraînement en cours...</>
-            : <><Play size={16}/> Lancer {arch}</>
+            : <><Play size={16}/> {trainScope === 'full' ? `Déployer ${arch} (toutes les données)` : `Lancer ${arch}`}</>
           }
         </button>
 
@@ -1217,7 +1269,11 @@ function DatasetCard({ datasets, currentDataset, currentDatasetId, onSelect }) {
                 <div>• Lookback : <b>{ds.preproc_config.lookback} jours</b></div>
                 <div>• MAX RUL : <b>{ds.preproc_config.current_max_rul} jours</b></div>
                 <div>• Poids RUL faibles : <b>×{ds.preproc_config.weight_factor}</b></div>
-                <div>• Test ratio : <b>{Math.round((ds.preproc_config.test_ratio ?? 0.2) * 100)}%</b></div>
+                <div>• Split temporel : <b>
+                  {Math.round((1 - (ds.preproc_config.val_ratio ?? 0.15) - (ds.preproc_config.test_ratio ?? 0.15)) * 100)}%
+                  {' '}/ {Math.round((ds.preproc_config.val_ratio ?? 0.15) * 100)}%
+                  {' '}/ {Math.round((ds.preproc_config.test_ratio ?? 0.15) * 100)}%
+                </b> <span style={{ color:'var(--text-muted)' }}>(train/val/test)</span></div>
               </div>
             </div>
           )}

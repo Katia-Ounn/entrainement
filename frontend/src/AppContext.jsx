@@ -115,6 +115,17 @@ export function AppProvider({ children }) {
       .forEach(k => localStorage.removeItem(k));
   }, []);
 
+  // Reset pipeline sans changer de dataset (après mise à jour données)
+  const resetPipelineResults = useCallback(() => {
+    setPrepStepCompleted([]);
+    setEdaRawResult(null);
+    setFeaturesResult(null);
+    setEdaFeatResult(null);
+    setPreprocResult(null);
+    ['cev_prep_done','cev_eda_raw','cev_features','cev_eda_feat','cev_preproc']
+      .forEach(k => localStorage.removeItem(k));
+  }, []);
+
   // Quand on change de dataset, on reset les caches d'étapes (résultats
   // précédents = ceux de l'ancien dataset, donc non valides).
   const selectDataset = useCallback((newId) => {
@@ -286,7 +297,7 @@ export function AppProvider({ children }) {
 
       // 📊 Préparation Données
       currentDatasetId,  setCurrentDatasetId, selectDataset,
-      prepStepCompleted, setPrepStepCompleted, markPrepStep, resetPrep,
+      prepStepCompleted, setPrepStepCompleted, markPrepStep, resetPrep, resetPipelineResults,
       edaRawResult,      setEdaRawResult,
       featuresResult,    setFeaturesResult,
       edaFeatResult,     setEdaFeatResult,

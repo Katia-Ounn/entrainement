@@ -1,0 +1,30 @@
+{
+  "model_type": "LSTM",
+  "lookback": 21,
+  "max_rul": 30,
+  "features": [
+    "comp_level",
+    "pannes_7j",
+    "pannes_30j",
+    "pannes_90j",
+    "maint_7j",
+    "maint_30j",
+    "maint_90j",
+    "DSLF",
+    "DSLM"
+  ],
+  "levels_modelises": [
+    3,
+    4
+  ],
+  "year_entrainement": 2023,
+  "min_failures": 2,
+  "num_composants": 164,
+  "embedding_dim": 8,
+  "metrics_test": {
+    "r2": -0.37183706984834464,
+    "mae": 9.711305618286133,
+    "recall": 0.11305732484076433,
+    "f1": 0.1637831603229527
+  }
+}

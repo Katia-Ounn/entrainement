@@ -229,17 +229,51 @@ def _invalidate_pipeline(dataset_id: int):
         _PIPELINE_CACHE.pop(dataset_id, None)
 
 
+def _prepare_pipeline_sync(dataset_id: int):
+    """Prépare le pipeline (chargement brut + compute_features + prepare_sequences).
+
+    SYNCHRONE et coûteux (pandas/numpy) — conçu pour tourner dans un thread via
+    asyncio.to_thread() afin de NE PAS bloquer la boucle asyncio. Sans ça, le
+    WebSocket ne peut pas se connecter pendant la préparation (cause de
+    « Erreur WebSocket » côté frontend). Ouvre sa propre session DB car les
+    sessions SQLAlchemy ne sont pas thread-safe.
+    """
+    db = next(get_db())
+    try:
+        ds   = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+        pipe = _get_pipeline(dataset_id, db)
+        if pipe.X_train_num is None:
+            if not ds.preproc_config:
+                raise RuntimeError("Aucune config prétraitement — relance /preprocessing")
+            pc = dict(ds.preproc_config)   # copie défensive
+            pc.pop("healthy_sample_frac", None)
+            feature_cols_override = pc.pop("feature_cols", None)
+            if pipe.df_export is None:
+                pipe.compute_features()
+            if feature_cols_override:
+                available = list(pipe.df_export.columns) if pipe.df_export is not None else []
+                missing   = [f for f in feature_cols_override if f not in available]
+                if not missing:
+                    pipe.FEATURE_COLS = list(feature_cols_override)
+            pipe.prepare_sequences(**pc)
+        return pipe
+    finally:
+        db.close()
+
+
 # ═══════════════════════════════════════════════════════════════
 # Gestionnaire WebSocket
 # ═══════════════════════════════════════════════════════════════
 class ConnectionManager:
     def __init__(self):
-        self.training:  dict[int, WebSocket] = {}
-        self.ingestion: Optional[WebSocket]  = None
+        self.training:  dict[int, WebSocket]      = {}
+        self.queues:    dict[int, asyncio.Queue]  = {}
+        self.ingestion: Optional[WebSocket]       = None
 
     async def connect_training(self, experiment_id: int, ws: WebSocket):
         await ws.accept()
         self.training[experiment_id] = ws
+        self.queues[experiment_id]   = asyncio.Queue()
 
     async def connect_ingestion(self, ws: WebSocket):
         await ws.accept()
@@ -247,17 +281,22 @@ class ConnectionManager:
 
     def disconnect_training(self, experiment_id: int):
         self.training.pop(experiment_id, None)
+        q = self.queues.pop(experiment_id, None)
+        if q is not None:
+            try:
+                q.put_nowait(None)   # sentinel — réveille le pump task
+            except Exception:
+                pass
 
     def disconnect_ingestion(self):
         self.ingestion = None
 
     async def send_training(self, experiment_id: int, data: dict):
-        ws = self.training.get(experiment_id)
-        if ws:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                self.disconnect_training(experiment_id)
+        q = self.queues.get(experiment_id)
+        if q is not None:
+            await q.put(data)
+        else:
+            print(f"[WS] ⚠ message perdu exp={experiment_id} type={data.get('type')} — aucun WS connecté", flush=True)
 
 
 manager = ConnectionManager()
@@ -463,11 +502,21 @@ async def update_dataset_data(
     df_existing = pd.read_csv(fail_path, encoding="utf-8-sig")
     n_existing  = len(df_existing)
 
-    # Concaténer + supprimer doublons
-    df_combined = pd.concat([df_existing, df_new_norm], ignore_index=True)
-    n_before    = len(df_combined)
-    df_combined = df_combined.drop_duplicates()
-    n_duplicates = n_before - len(df_combined)
+    # Vérifier les doublons uniquement dans les nouvelles lignes par rapport à l'existant
+    # (on ne touche PAS aux lignes existantes)
+    key_cols = [c for c in ["WOWO_DECLARATION_DATE", "WOWO_EQUIPMENT"]
+                if c in df_existing.columns and c in df_new_norm.columns]
+    if key_cols:
+        existing_keys  = set(map(tuple, df_existing[key_cols].astype(str).values.tolist()))
+        new_key_series = df_new_norm[key_cols].astype(str).apply(tuple, axis=1)
+        is_dup         = new_key_series.isin(existing_keys)
+        n_duplicates   = int(is_dup.sum())
+        df_to_add      = df_new_norm[~is_dup]
+    else:
+        n_duplicates = 0
+        df_to_add    = df_new_norm
+
+    df_combined = pd.concat([df_existing, df_to_add], ignore_index=True)
 
     # Trier par date
     date_col = "WOWO_DECLARATION_DATE"
@@ -480,18 +529,23 @@ async def update_dataset_data(
     else:
         date_min = date_max = None
 
+    # 🆕 Backup de l'état AVANT ajout → permet d'annuler le dernier ajout.
+    #    On copie le failure.csv ACTUEL (pas encore écrasé) vers failure_prev.csv.
+    import shutil
+    shutil.copy2(fail_path, folder / "failure_prev.csv")
+    (folder / "last_update.json").write_text(json.dumps({
+        "timestamp": datetime.utcnow().isoformat(),
+        "n_before":  n_existing,
+        "n_added":   int(len(df_to_add)),
+        "n_after":   int(len(df_combined)),
+        "date_min":  date_min,
+        "date_max":  date_max,
+    }, ensure_ascii=False), encoding="utf-8")
+
     # Sauvegarder failure.csv mis à jour
     df_combined.to_csv(fail_path, index=False)
 
-    # Mettre à jour l'equipment si nouveau format
-    if fmt == 'new':
-        equip_path = folder / "equipment.csv"
-        # Fusionner avec l'equipment existant si présent
-        if equip_path.exists():
-            df_eq_exist  = pd.read_csv(equip_path, encoding="utf-8-sig")
-            df_equip_new = pd.concat([df_eq_exist, df_equip_new], ignore_index=True).drop_duplicates()
-        df_equip_new.to_csv(equip_path, index=False)
-        ds.equipment_path = str(equip_path)
+    # equipment.csv non modifié — les composants existent déjà
 
     # Mettre à jour la BDD
     ds.failure_path = str(fail_path)
@@ -509,13 +563,76 @@ async def update_dataset_data(
         "ok":          True,
         "format":      fmt,
         "n_existing":  n_existing,
-        "n_new":       int(len(df_new_norm)),
+        "n_new":       int(len(df_to_add)),
         "n_duplicates": n_duplicates,
         "n_total":     int(len(df_combined)),
         "date_min":    date_min,
         "date_max":    date_max,
         "n_cols":    int(len(df_combined.columns)),
         "msg":       f"✅ Données mises à jour ({len(df_combined):,} lignes · {date_min} → {date_max})",
+    }
+
+
+@app.get("/api/datasets/{dataset_id}/can_undo_update")
+def can_undo_update(dataset_id: int):
+    """Indique si le DERNIER ajout de données peut être annulé (backup présent)."""
+    folder = DATASETS_DIR / str(dataset_id)
+    backup = folder / "failure_prev.csv"
+    if not backup.exists():
+        return {"can_undo": False}
+    info = {}
+    meta_f = folder / "last_update.json"
+    if meta_f.exists():
+        try:
+            info = json.loads(meta_f.read_text(encoding="utf-8"))
+        except Exception:
+            info = {}
+    return {"can_undo": True, "info": info}
+
+
+@app.post("/api/datasets/{dataset_id}/undo_update")
+def undo_update(dataset_id: int, db: Session = Depends(get_db)):
+    """Annule le DERNIER ajout : restaure le failure.csv d'avant l'ajout."""
+    ds = db.query(Dataset).filter(Dataset.id == dataset_id).first()
+    if not ds:
+        raise HTTPException(404, f"Dataset {dataset_id} introuvable")
+    folder    = DATASETS_DIR / str(dataset_id)
+    backup    = folder / "failure_prev.csv"
+    fail_path = folder / "failure.csv"
+    if not backup.exists():
+        raise HTTPException(400, "Aucun ajout à annuler (pas de sauvegarde).")
+
+    import shutil
+    shutil.copy2(backup, fail_path)                 # restaure l'état d'avant le dernier ajout
+    backup.unlink(missing_ok=True)
+    (folder / "last_update.json").unlink(missing_ok=True)
+
+    # Recalcule les infos du dataset depuis le failure.csv restauré
+    df = pd.read_csv(fail_path, encoding="utf-8-sig")
+    date_col = "WOWO_DECLARATION_DATE"
+    date_min = date_max = None
+    if date_col in df.columns:
+        d = pd.to_datetime(df[date_col], errors="coerce").dropna()
+        if len(d):
+            date_min = d.min().strftime("%Y-%m-%d")
+            date_max = d.max().strftime("%Y-%m-%d")
+
+    ds.failure_path = str(fail_path)
+    ds.n_rows       = int(len(df))
+    ds.period_start = date_min
+    ds.period_end   = date_max
+    ds.status       = DatasetStatus.UPLOADED
+    ds.v1_path      = None
+    db.add(ds); db.commit()
+
+    _invalidate_pipeline(dataset_id)
+
+    return {
+        "ok":       True,
+        "n_rows":   int(len(df)),
+        "date_min": date_min,
+        "date_max": date_max,
+        "msg":      f"↩️ Dernier ajout annulé — {len(df):,} lignes ({date_min} → {date_max})",
     }
 
 
@@ -684,15 +801,13 @@ def run_eda_features(dataset_id: int, db: Session = Depends(get_db)):
 
 
 class PreprocessingRequest(BaseModel):
-    lookback:        int   = Field(30, ge=3, le=180)
+    lookback:        int   = Field(21, ge=3, le=180)
     current_max_rul: int   = Field(30, ge=5, le=365)
-    weight_factor:   float = Field(15.0, ge=0.0, le=100.0)
-    test_ratio:      float = Field(0.20, ge=0.05, le=0.5)
-    healthy_sample_frac: float = Field(0.30, ge=0.05, le=1.0)
-    # 🆕 Lot C : permet à l'UI de choisir un sous-ensemble des features du Dataset_V1
-    # (par défaut = les 9 features du notebook). Si fourni, override pipe.FEATURE_COLS.
+    weight_factor:   float = Field(4.0, ge=0.0, le=50.0)
+    val_ratio:       float = Field(0.15, ge=0.05, le=0.4)
+    test_ratio:      float = Field(0.15, ge=0.05, le=0.4)
     feature_cols:    Optional[List[str]] = Field(None,
-                          description="Sous-ensemble de features. Si null, utilise les 9 du notebook.")
+                          description="Sous-ensemble de features. Si null, utilise les 11 du notebook.")
 
 
 @app.post("/api/datasets/{dataset_id}/preprocessing")
@@ -722,19 +837,19 @@ def run_preprocessing(
             pipe.FEATURE_COLS = list(req.feature_cols)
 
         result = pipe.prepare_sequences(
-            lookback            = req.lookback,
-            current_max_rul     = req.current_max_rul,
-            test_ratio          = req.test_ratio,
-            weight_factor       = req.weight_factor,
-            healthy_sample_frac = req.healthy_sample_frac,
+            lookback        = req.lookback,
+            current_max_rul = req.current_max_rul,
+            val_ratio       = req.val_ratio,
+            test_ratio      = req.test_ratio,
+            weight_factor   = req.weight_factor,
         )
         ds.preproc_config = {
-            "lookback":            req.lookback,
-            "current_max_rul":     req.current_max_rul,
-            "weight_factor":       req.weight_factor,
-            "test_ratio":          req.test_ratio,
-            "healthy_sample_frac": req.healthy_sample_frac,
-            "feature_cols":        list(pipe.FEATURE_COLS),   # 🆕 trace ce qui a vraiment été utilisé
+            "lookback":        req.lookback,
+            "current_max_rul": req.current_max_rul,
+            "weight_factor":   req.weight_factor,
+            "val_ratio":       req.val_ratio,
+            "test_ratio":      req.test_ratio,
+            "feature_cols":    list(pipe.FEATURE_COLS),
         }
         ds.status = DatasetStatus.PREPROCESSED
         db.commit()
@@ -913,12 +1028,12 @@ async def run_preprocessing_stream(
                 )
             pipe.FEATURE_COLS = list(req.feature_cols)
         return pipe.prepare_sequences(
-            lookback            = req.lookback,
-            current_max_rul     = req.current_max_rul,
-            test_ratio          = req.test_ratio,
-            weight_factor       = req.weight_factor,
-            healthy_sample_frac = req.healthy_sample_frac,
-            progress_callback   = progress,
+            lookback          = req.lookback,
+            current_max_rul   = req.current_max_rul,
+            val_ratio         = req.val_ratio,
+            test_ratio        = req.test_ratio,
+            weight_factor     = req.weight_factor,
+            progress_callback = progress,
         )
 
     async def worker():
@@ -938,12 +1053,12 @@ async def run_preprocessing_stream(
             local_ds = local_db.query(Dataset).filter(Dataset.id == dataset_id).first()
             if local_ds is not None:
                 local_ds.preproc_config = {
-                    "lookback":            req.lookback,
-                    "current_max_rul":     req.current_max_rul,
-                    "weight_factor":       req.weight_factor,
-                    "test_ratio":          req.test_ratio,
-                    "healthy_sample_frac": req.healthy_sample_frac,
-                    "feature_cols":        list(pipe.FEATURE_COLS),
+                    "lookback":        req.lookback,
+                    "current_max_rul": req.current_max_rul,
+                    "weight_factor":   req.weight_factor,
+                    "val_ratio":       req.val_ratio,
+                    "test_ratio":      req.test_ratio,
+                    "feature_cols":    list(pipe.FEATURE_COLS),
                 }
                 local_ds.status = DatasetStatus.PREPROCESSED
                 local_db.commit()
@@ -1091,22 +1206,43 @@ class TrainAutoRequest(BaseModel):
     dataset_id:    int
     name:          str
     architecture:  str = Field("LSTM", pattern="^(LSTM|GRU)$")
-    max_trials:    int = Field(10, ge=2, le=50)
-    epochs:        int = Field(12, ge=5, le=200, description="Époques PAR ESSAI bayésien")
+    max_trials:    int = Field(20, ge=2, le=100, description="n_calls pour gp_minimize (notebook : 20)")
+    epochs:        int = Field(20, ge=5, le=200, description="Époques PAR FOLD CV (notebook : 20)")
     batch_size:    int = Field(32, ge=8, le=512)
-    patience:      int = Field(7, ge=1, le=30)
+    patience:      int = Field(4, ge=1, le=30, description="Patience EarlyStopping CV (notebook : 4)")
     embedding_search: List[int] = Field([4, 8, 16, 32])
-    # 🆕 Bornes custom — défaut = notebook PFE_CHAMPION cell 56
-    units_min:     int   = Field(64,  ge=8, le=512)
+    # Bornes espace de recherche — défaut = notebook PFE exact
+    units_min:     int   = Field(32,  ge=8, le=512)
     units_max:     int   = Field(128, ge=8, le=512)
-    units_step:    int   = Field(32,  ge=1, le=64)
+    units_step:    int   = Field(32,  ge=1, le=64, description="Ignoré (gp_minimize optimise en continu)")
     nb_layers_min: int   = Field(1, ge=1, le=4)
-    nb_layers_max: int   = Field(2, ge=1, le=4)
+    nb_layers_max: int   = Field(1, ge=1, le=4, description="Couches LSTM (notebook : 1)")
     dropout_min:   float = Field(0.1, ge=0.0, le=0.9)
-    dropout_max:   float = Field(0.25, ge=0.0, le=0.9)
-    lr_choices:    List[float] = Field([1e-3, 2e-3])
-    # 🆕 Re-entraînement final du best model (notebook cell 61 : 60 époques)
-    final_epochs:  int = Field(60, ge=5, le=500, description="Époques pour entraîner le best model trouvé")
+    dropout_max:   float = Field(0.4, ge=0.0, le=0.9)
+    lr_choices:    List[float] = Field([1e-4, 1e-2], description="Bornes lr pour Real log-uniform")
+    # Re-entraînement final du best model (notebook : EPOCHS_FIN=35, batch=64)
+    final_epochs:  int = Field(35, ge=5, le=500, description="Époques entraînement final (notebook : 35)")
+    notes:         Optional[str] = None
+
+
+class TrainFullRequest(BaseModel):
+    """Réentraînement de DÉPLOIEMENT sur 100 % des données (train+val+test).
+
+    Mêmes hyperparamètres qu'en manuel (fixes). Le nombre d'époques utilisé est
+    la *meilleure époque* de l'expérience source (val_loss minimal) si
+    `source_experiment_id` est fourni ; sinon on retombe sur `epochs`.
+    """
+    dataset_id:    int
+    name:          str
+    architecture:  str       = Field("LSTM", pattern="^(LSTM|GRU)$")
+    embedding_dim: int       = Field(8, ge=2, le=64)
+    num_layers:    int       = Field(2, ge=1, le=3)
+    units:         List[int] = Field([64, 32])
+    dropout_rates: List[float] = Field([0.2, 0.15])
+    learning_rate: float     = Field(0.001, gt=0.0, le=0.1)
+    batch_size:    int       = Field(32, ge=8, le=512)
+    epochs:        int       = Field(50, ge=1, le=500, description="Fallback si pas d'historique source")
+    source_experiment_id: Optional[int] = Field(None, description="Expérience d'où récupérer la meilleure époque")
     notes:         Optional[str] = None
 
 
@@ -1203,21 +1339,27 @@ def _save_model_artifacts(exp_id: int, pipeline: CevitalPipeline,
     with open(model_dir / "comp_mapping.json", "w", encoding="utf-8") as f:
         json.dump(comp_mapping_flat, f, indent=2, ensure_ascii=False)
 
-    # 5. Predictions test set
+    # 5. Predictions
     y_true = np.array(training_result["y_true"])
     y_pred = np.array(training_result["y_pred"])
     n = min(len(y_true), len(y_pred))
     df_test = pipeline.get_test_dataframe()
     if df_test is not None:
         lb = pipeline.lookback
-        date_col = df_test["date"].iloc[lb:].values[:n]
-        comp_col = df_test[pipeline.COMP_COL].iloc[lb:].values[:n]
+        date_col = list(df_test["date"].iloc[lb:].values[:n])
+        comp_col = list(df_test[pipeline.COMP_COL].iloc[lb:].values[:n])
     else:
-        date_col = [""] * n
-        comp_col = [""] * n
+        date_col = []
+        comp_col = []
+    # Aligner date/comp sur la longueur des prédictions : en mode "full"
+    # (déploiement) y_true/y_pred couvrent train+val+test → plus de lignes que le
+    # seul jeu de test. On complète par "" pour éviter le mismatch de longueurs
+    # (pandas exige des colonnes de même taille). Inchangé pour manuel/auto.
+    date_col = (date_col + [""] * n)[:n]
+    comp_col = (comp_col + [""] * n)[:n]
     df_preds = pd.DataFrame({
-        "date":   date_col[:n],
-        "comp":   comp_col[:n],
+        "date":   date_col,
+        "comp":   comp_col,
         "y_true": y_true[:n],
         "y_pred": y_pred[:n],
         "error":  np.abs(y_true[:n] - y_pred[:n]),
@@ -1243,9 +1385,10 @@ async def _run_training_manual(exp_id: int, req: TrainManualRequest):
             if not ds.preproc_config:
                 raise RuntimeError("Aucune config prétraitement — relance /preprocessing")
             pc = dict(ds.preproc_config)   # copie défensive
-            # 🆕 feature_cols n'est PAS un paramètre de prepare_sequences :
-            # c'est un attribut du pipeline. On le sort de pc et on l'applique
-            # directement sur pipe.FEATURE_COLS avant.
+            # feature_cols et healthy_sample_frac ne sont pas des paramètres
+            # de prepare_sequences — on les retire avant de passer **pc.
+            pc.pop("healthy_sample_frac", None)
+            feature_cols_override = pc.pop("feature_cols", None)
             feature_cols_override = pc.pop("feature_cols", None)
             if pipe.df_export is None:
                 pipe.compute_features()
@@ -1317,36 +1460,27 @@ async def _run_training_manual(exp_id: int, req: TrainManualRequest):
 
 async def _run_training_auto(exp_id: int, req: TrainAutoRequest):
     """Task background : AutoML."""
+    print(f"\n[AUTO] Task démarré pour exp_id={exp_id}", flush=True)
     from tuner import CevitalTuner
     db = next(get_db())
     try:
+        print(f"[AUTO] DB connecté, chargement pipeline...", flush=True)
         exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
         ds  = db.query(Dataset).filter(Dataset.id == req.dataset_id).first()
         exp.status = TrainingStatus.RUNNING
         db.commit()
 
-        pipe = _get_pipeline(req.dataset_id, db)
-        if pipe.X_train_num is None:
-            if not ds.preproc_config:
-                raise RuntimeError("Aucune config prétraitement — relance /preprocessing")
-            pc = dict(ds.preproc_config)   # copie défensive
-            # 🆕 feature_cols n'est PAS un paramètre de prepare_sequences :
-            # c'est un attribut du pipeline. On le sort de pc et on l'applique
-            # directement sur pipe.FEATURE_COLS avant.
-            feature_cols_override = pc.pop("feature_cols", None)
-            if pipe.df_export is None:
-                pipe.compute_features()
-            if feature_cols_override:
-                available = list(pipe.df_export.columns) if pipe.df_export is not None else []
-                missing   = [f for f in feature_cols_override if f not in available]
-                if not missing:
-                    pipe.FEATURE_COLS = list(feature_cols_override)
-            pipe.prepare_sequences(**pc)
+        # ⚡ Préparation lourde (compute_features + prepare_sequences) déportée
+        #    dans un thread → la boucle asyncio reste libre pour accepter le
+        #    WebSocket pendant ce temps (sinon « Erreur WebSocket » au frontend).
+        pipe = await asyncio.to_thread(_prepare_pipeline_sync, req.dataset_id)
 
         async def send_fn(payload: dict):
             await manager.send_training(exp_id, payload)
 
+        print(f"[AUTO] Pipeline OK — X_train_num shape: {pipe.X_train_num.shape}", flush=True)
         tuner_obj = CevitalTuner(pipe, str(EXPORTS_DIR), req.name, send_fn=send_fn)
+        print(f"[AUTO] CevitalTuner créé, lancement train_auto...", flush=True)
         result = await tuner_obj.train_auto(
             architecture     = req.architecture,
             max_trials       = req.max_trials,
@@ -1412,6 +1546,106 @@ async def _run_training_auto(exp_id: int, req: TrainAutoRequest):
         db.close()
 
 
+async def _run_training_full(exp_id: int, req: TrainFullRequest):
+    """Task background : réentraînement DÉPLOIEMENT sur 100 % des données."""
+    print(f"\n[FULL] Task démarré pour exp_id={exp_id}", flush=True)
+    from full_trainer import CevitalFullTrainer
+    db = next(get_db())
+    try:
+        exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+        ds  = db.query(Dataset).filter(Dataset.id == req.dataset_id).first()
+        exp.status = TrainingStatus.RUNNING
+        db.commit()
+
+        # Préparation pipeline dans un thread (la boucle reste libre → WS OK)
+        pipe = await asyncio.to_thread(_prepare_pipeline_sync, req.dataset_id)
+
+        async def send_fn(payload: dict):
+            await manager.send_training(exp_id, payload)
+
+        # ── Modèle source : meilleure époque (val_loss min) + métriques héritées ──
+        src = None
+        if req.source_experiment_id is not None:
+            src = db.query(Experiment).filter(
+                Experiment.id == req.source_experiment_id
+            ).first()
+        best_epochs = int(req.epochs)
+        if src is not None and src.training_history:
+            valid = [
+                (int(h.get("epoch", i + 1)), float(h["val_loss"]))
+                for i, h in enumerate(src.training_history)
+                if h.get("val_loss") not in (None, 0, 0.0)
+            ]
+            if valid:
+                best_epochs = min(valid, key=lambda t: t[1])[0]
+
+        await send_fn({
+            "type": "log",
+            "message": (f"Meilleure époque retenue : {best_epochs} "
+                        f"(depuis l'expérience #{req.source_experiment_id})")
+                       if req.source_experiment_id else
+                       f"Époques (fixe) : {best_epochs}",
+        })
+
+        print(f"[FULL] Pipeline OK — époques={best_epochs}, lancement train_full...", flush=True)
+        trainer = CevitalFullTrainer(pipe, str(EXPORTS_DIR), req.name, send_fn=send_fn)
+        result = await trainer.train_full(
+            architecture  = req.architecture,
+            embedding_dim = req.embedding_dim,
+            num_layers    = req.num_layers,
+            units         = req.units,
+            dropout_rates = req.dropout_rates,
+            learning_rate = req.learning_rate,
+            epochs        = best_epochs,
+            batch_size    = req.batch_size,
+        )
+
+        model_dir = _save_model_artifacts(exp_id, pipe, result["model"], result)
+        # Métriques : on HÉRITE celles du modèle source (estimation honnête sur le
+        # jeu de TEST). Les métriques d'ajustement (sur données vues à l'entraînement)
+        # seraient trompeuses → on ne les stocke pas. Sans source : pas de métriques
+        # (le modèle est sauvegardé quand même).
+        exp.status       = TrainingStatus.COMPLETED
+        exp.completed_at = datetime.utcnow()
+        exp.duration_sec = result["duration_sec"]
+        exp.r2        = src.r2        if src else None
+        exp.mae       = src.mae       if src else None
+        exp.rmse      = src.rmse      if src else None
+        exp.mape      = src.mape      if src else None
+        exp.accuracy  = src.accuracy  if src else None
+        exp.precision = src.precision if src else None
+        exp.recall    = src.recall    if src else None
+        exp.f1_score  = src.f1_score  if src else None
+        exp.training_history = result["training_history"]
+        exp.model_dir        = str(model_dir)
+        exp.hyperparams      = {
+            "lookback":         pipe.lookback,
+            "current_max_rul":  pipe.current_max_rul,
+            "embedding_dim":    req.embedding_dim,
+            "num_layers":       req.num_layers,
+            "units":            req.units,
+            "dropout_rates":    req.dropout_rates,
+            "learning_rate":    req.learning_rate,
+            "batch_size":       req.batch_size,
+            "epochs":           best_epochs,
+            "weight_factor":    (ds.preproc_config or {}).get("weight_factor", 15.0),
+            "feature_cols":     pipe.FEATURE_COLS,
+            "mode":             "full",
+            "trained_on":       "all_data",
+            "n_sequences":      result.get("n_sequences"),
+            "source_experiment_id": req.source_experiment_id,
+        }
+        _save_metadata_json(model_dir, exp, pipe, req.architecture)
+        db.commit()
+    except Exception as e:
+        traceback.print_exc()
+        exp.status        = TrainingStatus.FAILED
+        exp.error_message = str(e)
+        db.commit()
+    finally:
+        db.close()
+
+
 @app.post("/api/train/manual", status_code=202)
 async def train_manual(req: TrainManualRequest,
                         background_tasks: BackgroundTasks,
@@ -1435,6 +1669,142 @@ async def train_manual(req: TrainManualRequest,
 
     background_tasks.add_task(_run_training_manual, exp.id, req)
     return {"experiment_id": exp.id, "status": "started"}
+
+
+@app.post("/api/train/full", status_code=202)
+async def train_full_endpoint(req: TrainFullRequest,
+                              background_tasks: BackgroundTasks,
+                              db: Session = Depends(get_db)):
+    """Réentraînement de DÉPLOIEMENT sur 100 % des données. Retourne exp_id."""
+    ds = db.query(Dataset).filter(Dataset.id == req.dataset_id).first()
+    if not ds:
+        raise HTTPException(404, "Dataset introuvable")
+    if ds.status != DatasetStatus.PREPROCESSED:
+        raise HTTPException(400, "Lance d'abord le prétraitement (/preprocessing)")
+
+    exp = Experiment(
+        name=req.name,
+        architecture=req.architecture,
+        mode="full",
+        status=TrainingStatus.PENDING,
+        dataset_id=req.dataset_id,
+        notes=req.notes,
+    )
+    db.add(exp); db.commit(); db.refresh(exp)
+
+    background_tasks.add_task(_run_training_full, exp.id, req)
+    return {"experiment_id": exp.id, "status": "started"}
+
+
+_NEXT_FAIL_MODEL_CACHE: dict = {}   # exp_id -> modèle Keras chargé (évite de recharger à chaque appel)
+
+
+@app.get("/api/experiments/{exp_id}/next_failures")
+def get_next_failures(exp_id: int, db: Session = Depends(get_db)):
+    """Prédit la PROCHAINE panne de chaque composant avec le modèle entraîné.
+
+    Pour chaque composant : on prend sa fenêtre la plus récente (les `lookback`
+    derniers jours), le modèle prédit le RUL → prochaine panne = dernière date du
+    composant + RUL. Renvoie aussi les pannes passées (historique) pour la timeline.
+    Endpoint synchrone (def) → exécuté dans le threadpool FastAPI (calcul lourd).
+    """
+    exp = db.query(Experiment).filter(Experiment.id == exp_id).first()
+    if not exp:
+        raise HTTPException(404, "Experiment introuvable")
+    if not exp.model_dir:
+        raise HTTPException(400, "Modèle non entraîné")
+    model_path = Path(exp.model_dir) / "model.keras"
+    if not model_path.exists():
+        raise HTTPException(404, "model.keras introuvable")
+
+    try:
+        # Pipeline préparé (features + scalers + mapping composant) pour ce dataset.
+        # ⚠️ 1er appel après un redémarrage = cache froid → préparation longue.
+        print(f"[NEXTFAIL] exp={exp_id} — préparation pipeline (dataset {exp.dataset_id})...", flush=True)
+        pipe = _prepare_pipeline_sync(exp.dataset_id)
+        df = pipe.df_export
+        if df is None or len(df) == 0:
+            raise HTTPException(400, "Données du dataset indisponibles")
+
+        # Modèle mis en cache par expérience → évite ~1-3 s de rechargement à chaque appel
+        model = _NEXT_FAIL_MODEL_CACHE.get(exp_id)
+        if model is None:
+            print(f"[NEXTFAIL] exp={exp_id} — chargement modèle Keras (1ère fois)...", flush=True)
+            from tensorflow.keras.models import load_model
+            # compile=False : inférence seule → pas besoin de la loss custom
+            # (asymmetric_rul_loss) ni de l'optimiseur. Évite le TypeError au chargement.
+            model = load_model(str(model_path), compile=False)
+            _NEXT_FAIL_MODEL_CACHE[exp_id] = model
+        print(f"[NEXTFAIL] exp={exp_id} — pipeline+modèle OK ({len(df)} lignes), prédiction...", flush=True)
+
+        lookback     = int(pipe.lookback)
+        feature_cols = list(pipe.FEATURE_COLS)
+        scaler_x     = pipe.scaler_x
+        scaler_y     = pipe.scaler_y
+        max_rul      = int(pipe.current_max_rul)
+        comp_to_idx  = getattr(pipe, "_comp_name_to_idx", {}) or {}
+        COMP         = pipe.COMP_COL
+
+        df = df.sort_values([COMP, "date"])
+        windows_num, windows_cat, meta = [], [], []
+        skipped = 0
+        for comp, g in df.groupby(COMP, sort=False):
+            if len(g) < lookback:
+                skipped += 1
+                continue
+            last_rows = g.iloc[-lookback:]
+            Xn   = scaler_x.transform(last_rows[feature_cols].values).astype("float32")
+            cidx = int(comp_to_idx.get(str(comp), 0))
+            windows_num.append(Xn)
+            windows_cat.append(np.full((lookback,), cidx, dtype="int32"))
+            past_fail = (
+                g.loc[g["failure"] == 1, "date"].astype(str).str.slice(0, 10).tolist()
+                if "failure" in g.columns else []
+            )
+            meta.append({
+                "comp":          str(comp),
+                "last_date":     str(g["date"].iloc[-1])[:10],
+                "past_failures": past_fail,
+                "n_failures":    len(past_fail),
+            })
+
+        if not windows_num:
+            return {"components": [], "max_rul": max_rul, "skipped": skipped, "n": 0}
+
+        Xn_all = np.stack(windows_num)
+        Xc_all = np.stack(windows_cat)
+        preds  = model.predict([Xn_all, Xc_all], verbose=0).flatten()
+        ruls   = np.clip(
+            scaler_y.inverse_transform(preds.reshape(-1, 1)).flatten(), 0, max_rul
+        )
+
+        results = []
+        for mrow, rul in zip(meta, ruls):
+            rul_days  = int(round(float(rul)))
+            last_dt   = pd.to_datetime(mrow["last_date"])
+            next_fail = (last_dt + pd.Timedelta(days=rul_days)).strftime("%Y-%m-%d")
+            results.append({
+                "comp":                   mrow["comp"],
+                "last_date":              mrow["last_date"],
+                "predicted_rul":          rul_days,
+                "predicted_next_failure": next_fail,
+                "past_failures":          mrow["past_failures"],
+                "n_failures":             mrow["n_failures"],
+            })
+        results.sort(key=lambda r: r["predicted_rul"])   # plus urgent en premier
+        print(f"[NEXTFAIL] exp={exp_id} — terminé ({len(results)} composants)", flush=True)
+        return {
+            "components": results,
+            "max_rul":    max_rul,
+            "n":          len(results),
+            "skipped":    skipped,
+            "data_end":   str(df["date"].max())[:10],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Erreur prédiction prochaine panne : {type(e).__name__}: {e}")
 
 
 @app.post("/api/train/auto", status_code=202)
@@ -1670,7 +2040,8 @@ import pandas as pd
 from tensorflow.keras.models import load_model
 
 # ── 1. Charger les artefacts ──────────────────────────────
-model    = load_model("model.keras")
+# compile=False : pour prédire, pas besoin de la loss custom (asymmetric_rul_loss)
+model    = load_model("model.keras", compile=False)
 scaler_x = joblib.load("scaler_x.pkl")
 scaler_y = joblib.load("scaler_y.pkl")
 
@@ -1917,12 +2288,46 @@ async def websocket_ingestion(websocket: WebSocket):
 @app.websocket("/ws/{experiment_id}")
 async def websocket_training(websocket: WebSocket, experiment_id: int):
     await manager.connect_training(experiment_id, websocket)
+    print(f"[WS] connecté exp={experiment_id}", flush=True)
+
+    async def _pump():
+        """Lit la queue et envoie au client — seul endroit qui appelle send_json."""
+        q = manager.queues.get(experiment_id)
+        if q is None:
+            return
+        while True:
+            item = await q.get()
+            if item is None:          # sentinel de fin
+                break
+            try:
+                await websocket.send_json(item)
+                print(f"[WS] → envoyé exp={experiment_id} type={item.get('type')}", flush=True)
+            except Exception as e:
+                print(f"[WS] ✗ échec send exp={experiment_id}: {type(e).__name__}: {e}", flush=True)
+                break
+
+    pump_task = asyncio.create_task(_pump())
     try:
         await websocket.send_json({
             "type": "info",
             "message": f"WS prêt pour exp {experiment_id} (live training updates).",
         })
         while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
+            try:
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                print(f"[WS] client déconnecté exp={experiment_id}", flush=True)
+                break
+            except Exception as e:
+                print(f"[WS] receive exception exp={experiment_id}: {type(e).__name__}: {e}", flush=True)
+                break
+    except Exception as e:
+        print(f"[WS] endpoint exception exp={experiment_id}: {type(e).__name__}: {e}", flush=True)
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
         manager.disconnect_training(experiment_id)
+        print(f"[WS] fermé exp={experiment_id}", flush=True)
